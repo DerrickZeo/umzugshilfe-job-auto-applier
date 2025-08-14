@@ -1,0 +1,363 @@
+# .github/workflows/deploy.yml
+# Automated deployment pipeline for Umzugshilfe Job Auto-Applier
+
+name: Deploy
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy to"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  AWS_REGION: eu-central-1
+  NODE_VERSION: "18"
+
+jobs:
+  # Security and dependency checking
+  security-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run security audit
+        run: npm audit --audit-level high
+
+      - name: Check for vulnerabilities
+        run: npm audit --audit-level moderate --output json > audit-results.json
+
+      - name: Upload security results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: security-audit
+          path: audit-results.json
+
+  # Unit and integration tests
+  test:
+    runs-on: ubuntu-latest
+    needs: security-check
+    strategy:
+      matrix:
+        test-type: [unit, integration]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install chromium
+
+      - name: Run ${{ matrix.test-type }} tests
+        run: npm run test:${{ matrix.test-type }}
+        env:
+          CI: true
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results-${{ matrix.test-type }}
+          path: |
+            test-results/
+            coverage/
+
+  # Build Lambda deployment package
+  build:
+    runs-on: ubuntu-latest
+    needs: [security-check, test]
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install production dependencies
+        run: npm ci --production
+
+      - name: Generate version
+        id: version
+        run: |
+          VERSION=$(echo $GITHUB_SHA | cut -c1-8)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Build Playwright layer
+        run: |
+          cd infrastructure/layers/playwright
+          ./build.sh
+
+      - name: Create Lambda deployment package
+        run: |
+          mkdir -p dist
+          cp -r src/* dist/
+          cp -r node_modules dist/
+          cd dist
+          zip -r ../lambda-deployment-${{ steps.version.outputs.version }}.zip .
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-package-${{ steps.version.outputs.version }}
+          path: |
+            lambda-deployment-*.zip
+            infrastructure/layers/playwright/playwright-layer.zip
+
+  # Deploy to staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
+    environment: staging
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup AWS CLI
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: deployment-package-${{ needs.build.outputs.version }}
+
+      - name: Deploy Playwright layer
+        run: |
+          aws s3 cp playwright-layer.zip s3://${{ secrets.LAYER_BUCKET_STAGING }}/
+
+          aws lambda publish-layer-version \
+            --layer-name playwright-chromium-layer-staging \
+            --content S3Bucket=${{ secrets.LAYER_BUCKET_STAGING }},S3Key=playwright-layer.zip \
+            --compatible-runtimes nodejs18.x
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file infrastructure/cloudformation/main.yaml \
+            --stack-name umzugshilfe-bot-staging \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              Environment=staging \
+              LoginUsername=${{ secrets.LOGIN_USERNAME_STAGING }} \
+              LoginPassword=${{ secrets.LOGIN_PASSWORD_STAGING }} \
+              ErrorNotificationEmail=${{ secrets.ERROR_EMAIL_STAGING }} \
+              GmailClientId=${{ secrets.GMAIL_CLIENT_ID }} \
+              GmailClientSecret=${{ secrets.GMAIL_CLIENT_SECRET }} \
+              GmailRefreshToken=${{ secrets.GMAIL_REFRESH_TOKEN_STAGING }}
+
+      - name: Update Lambda functions
+        run: |
+          aws lambda update-function-code \
+            --function-name umzugshilfe-job-processor-staging \
+            --zip-file fileb://lambda-deployment-${{ needs.build.outputs.version }}.zip
+            
+          aws lambda update-function-code \
+            --function-name umzugshilfe-gmail-watcher-staging \
+            --zip-file fileb://lambda-deployment-${{ needs.build.outputs.version }}.zip
+
+      - name: Run smoke tests
+        run: |
+          aws lambda invoke \
+            --function-name umzugshilfe-job-processor-staging \
+            --payload '{"source":"deployment_test","version":"${{ needs.build.outputs.version }}"}' \
+            --cli-binary-format raw-in-base64-out \
+            smoke-test-response.json
+
+          cat smoke-test-response.json
+
+  # Deploy to production
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [build, deploy-staging]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup AWS CLI
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: deployment-package-${{ needs.build.outputs.version }}
+
+      - name: Deploy Playwright layer
+        run: |
+          aws s3 cp playwright-layer.zip s3://${{ secrets.LAYER_BUCKET_PRODUCTION }}/
+
+          aws lambda publish-layer-version \
+            --layer-name playwright-chromium-layer-production \
+            --content S3Bucket=${{ secrets.LAYER_BUCKET_PRODUCTION }},S3Key=playwright-layer.zip \
+            --compatible-runtimes nodejs18.x
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file infrastructure/cloudformation/main.yaml \
+            --stack-name umzugshilfe-bot-production \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              Environment=production \
+              LoginUsername=${{ secrets.LOGIN_USERNAME_PRODUCTION }} \
+              LoginPassword=${{ secrets.LOGIN_PASSWORD_PRODUCTION }} \
+              ErrorNotificationEmail=${{ secrets.ERROR_EMAIL_PRODUCTION }} \
+              GmailClientId=${{ secrets.GMAIL_CLIENT_ID }} \
+              GmailClientSecret=${{ secrets.GMAIL_CLIENT_SECRET }} \
+              GmailRefreshToken=${{ secrets.GMAIL_REFRESH_TOKEN_PRODUCTION }}
+
+      - name: Update Lambda functions with blue-green deployment
+        run: |
+          # Create new version
+          NEW_VERSION=$(aws lambda update-function-code \
+            --function-name umzugshilfe-job-processor-production \
+            --zip-file fileb://lambda-deployment-${{ needs.build.outputs.version }}.zip \
+            --query 'Version' --output text)
+
+          # Update alias to new version
+          aws lambda update-alias \
+            --function-name umzugshilfe-job-processor-production \
+            --name LIVE \
+            --function-version $NEW_VERSION
+
+          # Update Gmail watcher
+          aws lambda update-function-code \
+            --function-name umzugshilfe-gmail-watcher-production \
+            --zip-file fileb://lambda-deployment-${{ needs.build.outputs.version }}.zip
+
+      - name: Run production smoke tests
+        run: |
+          sleep 30  # Wait for deployment to stabilize
+
+          aws lambda invoke \
+            --function-name umzugshilfe-job-processor-production \
+            --payload '{"source":"production_deployment_test","version":"${{ needs.build.outputs.version }}"}' \
+            --cli-binary-format raw-in-base64-out \
+            prod-smoke-test-response.json
+
+          cat prod-smoke-test-response.json
+
+      - name: Send deployment notification
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const { context } = require('@actions/github');
+            const message = `🚀 Production deployment completed!
+
+            **Version:** ${{ needs.build.outputs.version }}
+            **Commit:** ${context.sha.substring(0, 8)}
+            **Status:** ${{ job.status }}
+            **Timestamp:** ${new Date().toISOString()}
+
+            The Umzugshilfe Job Auto-Applier is now live with the latest updates.`;
+
+            // You can integrate with Slack, Discord, or email here
+            console.log(message);
+
+  # Performance monitoring
+  performance-test:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup AWS CLI
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run performance tests
+        run: |
+          # Run a series of performance tests
+          for i in {1..5}; do
+            echo "Performance test $i..."
+            START_TIME=$(date +%s%3N)
+            
+            aws lambda invoke \
+              --function-name umzugshilfe-job-processor-staging \
+              --payload '{"jobIds":["PERF_TEST_'$i'"],"source":"performance_test"}' \
+              --cli-binary-format raw-in-base64-out \
+              perf-test-$i.json
+            
+            END_TIME=$(date +%s%3N)
+            DURATION=$((END_TIME - START_TIME))
+            echo "Test $i duration: ${DURATION}ms"
+            
+            if [ $DURATION -gt 5000 ]; then
+              echo "⚠️ Performance warning: Test $i took ${DURATION}ms (>5s)"
+            fi
+            
+            sleep 2
+          done
+
+      - name: Generate performance report
+        run: |
+          echo "## Performance Test Results" > performance-report.md
+          echo "| Test | Duration | Status |" >> performance-report.md
+          echo "|------|----------|---------|" >> performance-report.md
+
+          for i in {1..5}; do
+            if [ -f "perf-test-$i.json" ]; then
+              STATUS=$(jq -r '.statusCode // "error"' perf-test-$i.json)
+              echo "| Test $i | ${DURATION}ms | $STATUS |" >> performance-report.md
+            fi
+          done
+
+      - name: Upload performance report
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-report
+          path: performance-report.md

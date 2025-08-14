@@ -1,0 +1,69 @@
+{
+  "name": "umzugshilfe-job-applier-playwright",
+  "version": "2.0.0",
+  "description": "Automated job application system for Umzugshilfe using Playwright for maximum speed and reliability",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test-playwright.js",
+    "test:full": "node test-playwright.js full",
+    "test:health": "node test-playwright.js health",
+    "test:performance": "node test-playwright.js performance",
+    "simulate": "node test-playwright.js simulate",
+    "deploy": "npm run build && npm run upload",
+    "build": "zip -r umzugshilfe-lambda-playwright.zip index.js gmail.js node_modules/",
+    "upload": "aws lambda update-function-code --function-name umzugshilfe-job-processor --zip-file fileb://umzugshilfe-lambda-playwright.zip",
+    "logs": "aws logs tail /aws/lambda/umzugshilfe-job-processor --follow",
+    "invoke": "aws lambda invoke --function-name umzugshilfe-job-processor --payload '{}' --cli-binary-format raw-in-base64-out response.json && cat response.json"
+  },
+  "dependencies": {
+    "playwright-aws-lambda": "^0.10.0",
+    "playwright-core": "^1.40.0",
+    "aws-sdk": "^2.1450.0",
+    "googleapis": "^126.0.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.40.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "automation",
+    "job-application",
+    "playwright",
+    "aws-lambda",
+    "umzugshilfe",
+    "web-scraping"
+  ],
+  "author": "Umzugshilfe Bot",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-username/umzugshilfe-bot.git"
+  },
+  "config": {
+    "playwright": {
+      "browsers": "chromium",
+      "headless": true
+    },
+    "aws": {
+      "region": "eu-central-1",
+      "runtime": "nodejs18.x",
+      "memory": 1536,
+      "timeout": 300
+    }
+  },
+  "bundleDependencies": false,
+  "optionalDependencies": {},
+  "peerDependencies": {},
+  "files": [
+    "index.js",
+    "gmail.js",
+    "README.md",
+    "package.json"
+  ],
+  "homepage": "https://github.com/your-username/umzugshilfe-bot#readme",
+  "bugs": {
+    "url": "https://github.com/your-username/umzugshilfe-bot/issues"
+  }
+}

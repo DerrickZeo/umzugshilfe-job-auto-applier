@@ -1,0 +1,188 @@
+# Umzugshilfe Job Auto-Applier .gitignore
+
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# Environment variables and secrets
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+config/secrets.json
+credentials.json
+
+# AWS and deployment files
+.aws/
+aws-credentials.json
+deployment-package.zip
+playwright-layer.zip
+lambda-deployment.zip
+
+# Lambda function packages
+*.zip
+dist/
+build/
+
+# Test and coverage files
+coverage/
+.nyc_output/
+test-results/
+test-reports/
+*.lcov
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Runtime and temporary files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*~
+.tmp/
+.temp/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# Playwright specific
+test-results/
+playwright-report/
+playwright/.cache/
+screenshots/
+videos/
+
+# Browser downloads and cache
+downloads/
+.cache/
+.browser_cache/
+
+# CloudFormation and Terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform/
+cloudformation-package.yaml
+packaged-template.yaml
+
+# Local development
+docker-compose.override.yml
+.docker/
+local-dev/
+
+# Documentation builds
+docs/_build/
+docs/site/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Archive files
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# Monitoring and metrics
+metrics/
+monitoring-data/
+performance-logs/
+
+# Backup files
+*.bak
+*.backup
+*.old
+*.orig
+
+# Local Lambda testing
+.sam/
+samconfig.toml
+template.packaged.yaml
+
+# Python (if using any Python scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Email testing data
+test-emails/
+sample-data/
+*.eml
+
+# Performance testing
+k6-results/
+load-test-reports/
+
+# Security scanning results
+security-reports/
+vulnerability-scans/
+
+# Local configuration overrides
+local-config.json
+override-config.js
+
+# Generated files
+generated/
+auto-generated/
+
+# Lambda layers
+layers/*/nodejs/node_modules/
+layers/*/build/
+
+# Temporary deployment files
+deploy-temp/
+staging/
+
+# Local debugging
+debug/
+debug-*.png
+debug-*.jpg
+error-screenshots/
+
+# Lock files (keep package-lock.json in main, ignore in subdirectories)
+**/package-lock.json
+!package-lock.json
+
+# Error logs and debugging
+error-*.log
+debug-*.log
+trace-*.log
