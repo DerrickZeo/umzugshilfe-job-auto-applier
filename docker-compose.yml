@@ -1,22 +1,14 @@
-version: '3.8'
-services:
-  app:
-    build: .
-    ports:
-      - "3000:3000"
-    environment:
-      - NODE_ENV=development
-    volumes:# docker-compose.yml
+# docker-compose.yml
 # Local development environment for Umzugshilfe Job Auto-Applier
 
-version: '3.8'
+version: "3.8"
 
 services:
   # Main application container
   umzugshilfe-app:
     build:
       context: .
-      dockerfile: Dockerfile.dev
+      dockerfile: Dockerfile
     container_name: umzugshilfe-app
     ports:
       - "3000:3000"
@@ -38,24 +30,36 @@ services:
     restart: unless-stopped
 
   # LocalStack for AWS services emulation
+  # localstack:
+  #   image: localstack/localstack:latest
+  #   container_name: localstack
+  #   ports:
+  #     - "4566:4566" # LocalStack gateway
+  #     - "4571:4571" # LocalStack dashboard
+  #   environment:
+  #     - SERVICES=lambda,dynamodb,sns,s3,cloudformation,logs,events
+  #     - DEBUG=1
+  #     - DATA_DIR=/tmp/localstack/data
+  #     - LAMBDA_EXECUTOR=docker-reuse
+  #     - DOCKER_HOST=unix:///var/run/docker.sock
+  #     - HOST_TMP_FOLDER=/tmp/localstack
+  #   volumes:
+  #     - "/tmp/localstack:/tmp/localstack"
+  #     - "/var/run/docker.sock:/var/run/docker.sock"
+  #   networks:
+  #     - umzugshilfe-network
+
   localstack:
     image: localstack/localstack:latest
-    container_name: localstack
-    ports:
-      - "4566:4566"  # LocalStack gateway
-      - "4571:4571"  # LocalStack dashboard
     environment:
-      - SERVICES=lambda,dynamodb,sns,s3,cloudformation,logs,events
+      - SERVICES=s3,dynamodb,lambda
       - DEBUG=1
       - DATA_DIR=/tmp/localstack/data
-      - LAMBDA_EXECUTOR=docker-reuse
-      - DOCKER_HOST=unix:///var/run/docker.sock
-      - HOST_TMP_FOLDER=/tmp/localstack
     volumes:
-      - "/tmp/localstack:/tmp/localstack"
-      - "/var/run/docker.sock:/var/run/docker.sock"
-    networks:
-      - umzugshilfe-network
+      - "./tmp/localstack:/tmp/localstack" # Add this if missing
+      - "/var/run/docker.sock:/var/run/docker.sock" # Add this if missing
+    ports:
+      - "4566:4566"
 
   # Redis for caching and session management
   redis:
@@ -80,26 +84,11 @@ services:
     networks:
       - umzugshilfe-network
 
-  # Gmail mock server for testing
-  gmail-mock:
-    build:
-      context: ./tests/mocks
-      dockerfile: Dockerfile.gmail-mock
-    container_name: gmail-mock
-    ports:
-      - "8080:8080"
-    environment:
-      - MOCK_EMAILS_PATH=/app/fixtures/emails
-    volumes:
-      - ./tests/fixtures:/app/fixtures
-    networks:
-      - umzugshilfe-network
-
   # Test runner service
   test-runner:
     build:
       context: .
-      dockerfile: Dockerfile.test
+      dockerfile: Dockerfile
     container_name: test-runner
     volumes:
       - ./src:/app/src
@@ -112,11 +101,11 @@ services:
     depends_on:
       - localstack
       - redis
-      - gmail-mock
     networks:
       - umzugshilfe-network
     profiles:
       - testing
+    command: npm test
 
   # Monitoring and observability
   prometheus:
@@ -128,11 +117,11 @@ services:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
       - prometheus-data:/prometheus
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/etc/prometheus/console_libraries'
-      - '--web.console.templates=/etc/prometheus/consoles'
-      - '--web.enable-lifecycle'
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--web.enable-lifecycle"
     networks:
       - umzugshilfe-network
     profiles:
@@ -156,62 +145,17 @@ services:
     profiles:
       - monitoring
 
-  # Log aggregation
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
-    container_name: elasticsearch
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-    ports:
-      - "9200:9200"
-    volumes:
-      - elasticsearch-data:/usr/share/elasticsearch/data
-    networks:
-      - umzugshilfe-network
-    profiles:
-      - logging
-
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.11.0
-    container_name: kibana
-    ports:
-      - "5601:5601"
-    environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-    depends_on:
-      - elasticsearch
-    networks:
-      - umzugshilfe-network
-    profiles:
-      - logging
-
   # Development tools
   mailhog:
     image: mailhog/mailhog:latest
     container_name: mailhog
     ports:
-      - "1025:1025"  # SMTP
-      - "8025:8025"  # Web UI
+      - "1025:1025" # SMTP
+      - "8025:8025" # Web UI
     networks:
       - umzugshilfe-network
     profiles:
       - tools
-
-  # Load testing
-  k6:
-    image: grafana/k6:latest
-    container_name: k6
-    volumes:
-      - ./tests/load:/scripts
-    command: run /scripts/load-test.js
-    depends_on:
-      - umzugshilfe-app
-    networks:
-      - umzugshilfe-network
-    profiles:
-      - load-testing
 
 networks:
   umzugshilfe-network:
@@ -227,23 +171,16 @@ volumes:
     driver: local
   grafana-data:
     driver: local
-  elasticsearch-data:
-    driver: local
-
 # Development commands:
 # docker-compose up -d                          # Start core services
 # docker-compose --profile testing up -d        # Include testing services
 # docker-compose --profile monitoring up -d     # Include monitoring
-# docker-compose --profile logging up -d        # Include logging
 # docker-compose --profile tools up -d          # Include dev tools
-# docker-compose --profile load-testing up      # Run load tests
 #
 # Useful URLs:
 # - Application: http://localhost:3000
 # - LocalStack: http://localhost:4566
 # - Grafana: http://localhost:3001 (admin/admin)
 # - Prometheus: http://localhost:9090
-# - Kibana: http://localhost:5601
 # - MailHog: http://localhost:8025
 # - DynamoDB Admin: http://localhost:8000
-      - ./src:/app/src

@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Simplified Umzugshilfe Job Auto-Applier with IMAP"
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: EC2 instance type
+
+  LoginUsername:
+    Type: String
+    Description: Umzugshilfe login username
+    NoEcho: true
+
+  LoginPassword:
+    Type: String
+    Description: Umzugshilfe login password
+    NoEcho: true
+
+  EmailAddress:
+    Type: String
+    Description: Gmail address for sending emails
+    NoEcho: false
+
+  EmailPassword:
+    Type: String
+    Description: Gmail app password (16 characters from Google Account)
+    NoEcho: true
+
+  SMTPHost:
+    Type: String
+    Default: smtp.gmail.com
+    Description: SMTP server hostname
+
+  SMTPPort:
+    Type: Number
+    Default: 587
+    Description: SMTP server port
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: Latest Amazon Linux 2023 AMI ID
+
+Resources:
+  # Security Group
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Umzugshilfe instance
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0 # Consider restricting this to your IP
+          Description: SSH access
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+          Description: Application port
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
+
+  # Systems Manager Parameters for credentials
+  LoginUsernameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/username"
+      Type: String
+      Value: !Ref LoginUsername
+
+  LoginPasswordParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/password"
+      Type: String
+      Value: !Ref LoginPassword
+
+  EmailAddressParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/email-address"
+      Type: String
+      Value: !Ref EmailAddress
+
+  EmailPasswordParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/email-password"
+      Type: String
+      Value: !Ref EmailPassword
+
+  SMTPHostParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/smtp-host"
+      Type: String
+      Value: !Ref SMTPHost
+
+  SMTPPortParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/smtp-port"
+      Type: String
+      Value: !Ref SMTPPort
+
+  # IAM Role for EC2 instance
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GetSSMParameters
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # EC2 Instance
+  UmzugshilfeInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+
+          # Install Node.js 18
+          curl -sL https://rpm.nodesource.com/setup_18.x | bash -
+          yum install -y nodejs git docker
+
+          # Start Docker
+          systemctl start docker
+          systemctl enable docker
+          usermod -a -G docker ec2-user
+
+          # Install Docker Compose
+          curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+
+          # Clone application
+          cd /home/ec2-user
+          git clone https://github.com/DerrickZeo/umzugshilfe-job-auto-applier.git
+          cd umzugshilfe-job-auto-applier
+          chown -R ec2-user:ec2-user .
+
+          # Get credentials from SSM
+          USERNAME=$(aws ssm get-parameter --region ${AWS::Region} --name "/${AWS::StackName}/username" --with-decryption --query Parameter.Value --output text)
+          PASSWORD=$(aws ssm get-parameter --region ${AWS::Region} --name "/${AWS::StackName}/password" --with-decryption --query Parameter.Value --output text)
+          EMAIL_ADDRESS=$(aws ssm get-parameter --region ${AWS::Region} --name "/${AWS::StackName}/email-address" --query Parameter.Value --output text)
+          EMAIL_PASSWORD=$(aws ssm get-parameter --region ${AWS::Region} --name "/${AWS::StackName}/email-password" --with-decryption --query Parameter.Value --output text)
+          SMTP_HOST=$(aws ssm get-parameter --region ${AWS::Region} --name "/${AWS::StackName}/smtp-host" --query Parameter.Value --output text)
+          SMTP_PORT=$(aws ssm get-parameter --region ${AWS::Region} --name "/${AWS::StackName}/smtp-port" --query Parameter.Value --output text)
+
+          # Create environment file
+          cat > .env << EOF
+          NODE_ENV=production
+          PORT=3000
+          LOGIN_USERNAME=$USERNAME
+          LOGIN_PASSWORD=$PASSWORD
+          EMAIL_ADDRESS=$EMAIL_ADDRESS
+          EMAIL_PASSWORD=$EMAIL_PASSWORD
+          SMTP_HOST=$SMTP_HOST
+          SMTP_PORT=$SMTP_PORT
+          EMAIL_SECURE=true
+          EOF
+
+          # Build and start with Docker
+          sudo -u ec2-user docker build -t umzugshilfe-app .
+          sudo -u ec2-user docker run -d \
+            --name umzugshilfe \
+            --restart unless-stopped \
+            -p 3000:3000 \
+            --env-file .env \
+            umzugshilfe-app
+
+          # Create systemd service for auto-restart
+          cat > /etc/systemd/system/umzugshilfe.service << 'SVCEOF'
+          [Unit]
+          Description=Umzugshilfe Docker Container
+          After=docker.service
+          Requires=docker.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          WorkingDirectory=/home/ec2-user/umzugshilfe-job-auto-applier
+          ExecStart=/usr/bin/docker start umzugshilfe
+          ExecStop=/usr/bin/docker stop umzugshilfe
+          TimeoutStartSec=0
+
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+
+          systemctl enable umzugshilfe
+          systemctl start umzugshilfe
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance"
+
+Outputs:
+  InstancePublicIP:
+    Description: Public IP address of the EC2 instance
+    Value: !GetAtt UmzugshilfeInstance.PublicIp
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicIP"
+
+  ApplicationURL:
+    Description: URL to access the application
+    Value: !Sub "http://${UmzugshilfeInstance.PublicIp}:3000"
+    Export:
+      Name: !Sub "${AWS::StackName}-AppURL"
+
+  HealthCheckURL:
+    Description: Health check endpoint
+    Value: !Sub "http://${UmzugshilfeInstance.PublicIp}:3000/health"
+    Export:
+      Name: !Sub "${AWS::StackName}-HealthURL"
+
+  SSHCommand:
+    Description: SSH command to connect to the instance
+    Value: !Sub "ssh -i ${KeyPairName}.pem ec2-user@${UmzugshilfeInstance.PublicIp}"
+    Export:
+      Name: !Sub "${AWS::StackName}-SSHCommand"
