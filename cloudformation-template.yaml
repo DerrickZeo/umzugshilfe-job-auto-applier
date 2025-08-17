@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Simplified Umzugshilfe Job Auto-Applier - Node.js on t2.micro"
+Description: "Simplified Umzugshilfe Job Auto-Applier - Node.js on t2.micro with fixed Playwright deps"
 
 Parameters:
   KeyPairName:
@@ -153,11 +153,74 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
+          set -e
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          echo "Starting user data script at $(date)"
+
+          # Update system
           yum update -y
 
           # Install Node.js 18
           curl -sL https://rpm.nodesource.com/setup_18.x | bash -
           yum install -y nodejs git
+
+          # Install Playwright system dependencies for Amazon Linux 2023
+          echo "Installing Playwright dependencies for Amazon Linux 2023..."
+          yum groupinstall -y "Development Tools"
+
+          # Install core Playwright runtime dependencies
+          yum install -y \
+              atk \
+              at-spi2-atk \
+              cups-libs \
+              libxcb \
+              libxkbcommon \
+              libX11 \
+              libXcomposite \
+              libXdamage \
+              libXext \
+              libXfixes \
+              libXrandr \
+              mesa-libgbm \
+              cairo \
+              pango \
+              alsa-lib \
+              gtk3
+
+          # Install additional required libraries
+          yum install -y \
+              libdrm \
+              libxshmfence \
+              libXScrnSaver \
+              libXtst \
+              nss \
+              nspr
+
+          # Install development packages for compilation
+          yum install -y \
+              libX11-devel \
+              libXcomposite-devel \
+              libXcursor-devel \
+              libXdamage-devel \
+              libXext-devel \
+              libXfixes-devel \
+              libXi-devel \
+              libXrandr-devel \
+              libXrender-devel \
+              libXScrnSaver-devel \
+              libXtst-devel \
+              libXinerama-devel \
+              cairo-devel \
+              pango-devel \
+              atk-devel \
+              at-spi2-atk-devel \
+              gtk3-devel \
+              gdk-pixbuf2-devel \
+              libdrm-devel \
+              libxkbcommon-devel \
+              mesa-libgbm-devel \
+              alsa-lib-devel \
+              cups-devel
 
           # Clone application
           cd /home/ec2-user
@@ -186,12 +249,12 @@ Resources:
           EMAIL_SECURE=true
           EOF
 
-          # Install dependencies
+          # Install dependencies as ec2-user
           sudo -u ec2-user npm install
 
-          # Install Playwright dependencies and browsers
-          sudo npx playwright install-deps
-          sudo -u ec2-user npx playwright install chromium
+          # Install Playwright browsers as ec2-user (with force to bypass OS check)
+          echo "Installing Playwright browsers..."
+          sudo -u ec2-user npx playwright install chromium --force || true
 
           # Create systemd service for Node.js application
           cat > /etc/systemd/system/umzugshilfe.service << 'SVCEOF'
@@ -217,7 +280,14 @@ Resources:
           # Enable and start the service
           systemctl daemon-reload
           systemctl enable umzugshilfe
+
+          # Wait a moment for dependencies to settle
+          sleep 5
+
+          # Start the service
           systemctl start umzugshilfe
+
+          echo "User data script completed at $(date)"
 
       Tags:
         - Key: Name

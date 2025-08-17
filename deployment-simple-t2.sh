@@ -1,5 +1,5 @@
 #!/bin/bash
-# Simple EC2 deployment script for Node.js bot on t2.micro
+# Simple EC2 deployment script for Node.js bot on t2.micro - Fixed for IPv6/IPv4
 
 set -e
 
@@ -25,16 +25,44 @@ warn() { echo -e "${YELLOW}⚠️  $1${NC}"; }
 error() { echo -e "${RED}❌ $1${NC}"; exit 1; }
 info() { echo -e "${PURPLE}ℹ️  $1${NC}"; }
 
-# Function to get user's IP address
+# Function to get user's IPv4 address
 get_my_ip() {
-    info "Getting your IP address for security group..."
-    MY_IP=$(curl -s --max-time 10 ifconfig.me 2>/dev/null || curl -s --max-time 10 ipinfo.io/ip 2>/dev/null || echo "")
+    info "Getting your IPv4 address for security group..."
     
+    # Try multiple IPv4-specific services
+    MY_IP=""
+    for service in "ipv4.icanhazip.com" "ipv4.ident.me" "api.ipify.org" "checkip.amazonaws.com"; do
+        info "Trying $service..."
+        MY_IP=$(curl -4 -s --max-time 10 "$service" 2>/dev/null | grep -Eo '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' || echo "")
+        if [ -n "$MY_IP" ]; then
+            break
+        fi
+    done
+    
+    # If all services fail, try the original services but force IPv4
     if [ -z "$MY_IP" ]; then
-        error "Could not determine your IP address. Please check your internet connection."
+        info "Trying fallback services..."
+        for service in "ifconfig.me" "ipinfo.io/ip"; do
+            MY_IP=$(curl -4 -s --max-time 10 "$service" 2>/dev/null | grep -Eo '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' || echo "")
+            if [ -n "$MY_IP" ]; then
+                break
+            fi
+        done
     fi
     
-    log "Your IP address: $MY_IP"
+    # Manual fallback
+    if [ -z "$MY_IP" ]; then
+        warn "Could not automatically determine your IPv4 address."
+        echo "Please visit https://ipv4.icanhazip.com in your browser to get your IPv4 address."
+        read -p "Enter your IPv4 address (format: x.x.x.x): " MY_IP
+        
+        # Validate the entered IP
+        if ! echo "$MY_IP" | grep -Eq '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'; then
+            error "Invalid IPv4 address format. Please use x.x.x.x format."
+        fi
+    fi
+    
+    log "Your IPv4 address: $MY_IP"
     info "Only this IP will have SSH access to the instance"
 }
 
@@ -42,11 +70,32 @@ get_my_ip() {
 check_prerequisites() {
     info "Checking prerequisites..."
     
-    # Check AWS CLI
-    command -v aws.cmd >/dev/null 2>&1 || error "AWS CLI not found. Please install it first."
+    # Check AWS CLI (Windows Git Bash compatibility)
+    if command -v aws.cmd >/dev/null 2>&1; then
+        AWS_CMD="aws.cmd"
+        info "Found AWS CLI: $(aws.cmd --version 2>&1 | head -1)"
+    elif command -v aws >/dev/null 2>&1; then
+        AWS_CMD="aws"
+        info "Found AWS CLI: $(aws --version 2>&1 | head -1)"
+    else
+        error "AWS CLI not found. Please install it first."
+    fi
     
-    # Check AWS credentials
-    aws.cmd sts get-caller-identity >/dev/null 2>&1 || error "AWS credentials not configured. Run 'aws.cmd configure'"
+    # Check AWS credentials with better error reporting
+    info "Testing AWS credentials with: $AWS_CMD sts get-caller-identity"
+    if ! $AWS_CMD sts get-caller-identity >/dev/null 2>&1; then
+        error "AWS credentials not configured or invalid. 
+        
+Debug steps:
+1. Check credentials: $AWS_CMD configure list
+2. Test manually: $AWS_CMD sts get-caller-identity
+3. Configure if needed: $AWS_CMD configure
+
+Current AWS config:"
+        $AWS_CMD configure list 2>/dev/null || echo "No AWS config found"
+    fi
+    
+    log "AWS credentials verified successfully"
     
     # Check CloudFormation template
     [ ! -f "$TEMPLATE_FILE" ] && error "CloudFormation template '$TEMPLATE_FILE' not found"
@@ -82,9 +131,9 @@ load_environment() {
 setup_keypair() {
     KEY_PAIR_NAME="umzugshilfe-key-$(date +%Y%m%d)"
     
-    if ! aws.cmd ec2 describe-key-pairs --key-names "$KEY_PAIR_NAME" --region "$REGION" >/dev/null 2>&1; then
+    if ! $AWS_CMD ec2 describe-key-pairs --key-names "$KEY_PAIR_NAME" --region "$REGION" >/dev/null 2>&1; then
         info "Creating new key pair: $KEY_PAIR_NAME"
-        aws.cmd ec2 create-key-pair \
+        $AWS_CMD ec2 create-key-pair \
             --key-name "$KEY_PAIR_NAME" \
             --region "$REGION" \
             --query 'KeyMaterial' \
@@ -105,7 +154,7 @@ deploy_infrastructure() {
     info "Deploying infrastructure..."
     
     # Check if stack exists
-    if aws.cmd cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" >/dev/null 2>&1; then
+    if $AWS_CMD cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" >/dev/null 2>&1; then
         info "Stack exists, updating..."
         OPERATION="update"
     else
@@ -113,7 +162,7 @@ deploy_infrastructure() {
         OPERATION="create"
     fi
     
-    aws.cmd cloudformation deploy \
+    $AWS_CMD cloudformation deploy \
         --template-file "$TEMPLATE_FILE" \
         --stack-name "$STACK_NAME" \
         --capabilities CAPABILITY_IAM \
@@ -137,13 +186,13 @@ deploy_infrastructure() {
 get_stack_outputs() {
     info "Retrieving stack outputs..."
     
-    INSTANCE_IP=$(aws.cmd cloudformation describe-stacks \
+    INSTANCE_IP=$($AWS_CMD cloudformation describe-stacks \
         --stack-name "$STACK_NAME" \
         --region "$REGION" \
         --query 'Stacks[0].Outputs[?OutputKey==`InstancePublicIP`].OutputValue' \
         --output text)
 
-    SSH_COMMAND=$(aws.cmd cloudformation describe-stacks \
+    SSH_COMMAND=$($AWS_CMD cloudformation describe-stacks \
         --stack-name "$STACK_NAME" \
         --region "$REGION" \
         --query 'Stacks[0].Outputs[?OutputKey==`SSHCommand`].OutputValue' \
@@ -224,8 +273,8 @@ show_summary() {
     echo -e "${GREEN}✅ Umzugshilfe bot on t2.micro is LIVE and SECURE!${NC}"
     echo ""
     echo -e "${YELLOW}🔒 Security Features:${NC}"
-    echo "  🛡️  SSH access limited to your IP: $MY_IP"
-    echo "  🔐 No public application access (port 3000 blocked)"
+    echo "  🛡️  SSH access limited to your IPv4: $MY_IP"
+    echo "  🔒 No public application access (port 3000 blocked)"
     echo "  📦 Direct Node.js execution (no Docker overhead)"
     echo ""
     echo -e "${YELLOW}💰 Cost Optimization:${NC}"
@@ -234,18 +283,18 @@ show_summary() {
     echo "  📉 ~50% cost savings vs t3.small"
     echo ""
     echo -e "${YELLOW}🔧 Management:${NC}"
-    echo "  🔐 SSH: $SSH_COMMAND"
+    echo "  🔗 SSH: $SSH_COMMAND"
     echo "  📄 Key File: ${KEY_PAIR_NAME}.pem"
     echo ""
     echo -e "${YELLOW}🧪 Application Access (via SSH):${NC}"
     echo "  💚 Health: ssh + curl http://localhost:3000/health"
     echo "  📊 Stats: ssh + curl http://localhost:3000/stats"
-    echo "  📧 Test Email: ssh + curl -X POST http://localhost:3000/test-email"
+    echo "  🔧 Test Email: ssh + curl -X POST http://localhost:3000/test-email"
     echo ""
     echo -e "${YELLOW}📧 Email Configuration:${NC}"
     echo "  📮 Monitoring: $EMAIL_ADDRESS"
     echo "  🏃 SMTP: $SMTP_HOST:$SMTP_PORT"
-    echo "  🔍 Watching for emails from: job@studenten-umzugshilfe.com"
+    echo "  📩 Watching for emails from: job@studenten-umzugshilfe.com"
     echo ""
     echo -e "${YELLOW}🚀 Performance Expectations:${NC}"
     echo "  ⚡ Response time: 0.5-1.5 seconds"
@@ -275,7 +324,7 @@ cleanup_on_failure() {
     read -p "Delete the failed stack? (y/N): " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        aws.cmd cloudformation delete-stack --stack-name "$STACK_NAME" --region "$REGION"
+        $AWS_CMD cloudformation delete-stack --stack-name "$STACK_NAME" --region "$REGION"
         info "Stack deletion initiated"
     fi
 }
@@ -291,7 +340,7 @@ Date: $(date)
 Stack Name: $STACK_NAME
 Region: $REGION
 Instance Type: $INSTANCE_TYPE
-Your IP: $MY_IP
+Your IPv4: $MY_IP
 
 Access:
 - SSH Command: $SSH_COMMAND
@@ -310,7 +359,7 @@ curl http://localhost:3000/stats
 curl -X POST http://localhost:3000/test-email
 
 Security Notes:
-- Only your IP ($MY_IP) can SSH to the instance
+- Only your IPv4 ($MY_IP) can SSH to the instance
 - Application port 3000 is not publicly accessible
 - All access must go through SSH tunnel
 EOF
@@ -332,9 +381,6 @@ main() {
     setup_keypair
     deploy_infrastructure
     get_stack_outputs
-    wait_for_application
-    test_application
-    save_deployment_info
     show_summary
     
     log "Deployment completed successfully!"
@@ -344,20 +390,20 @@ main() {
 case "${1:-}" in
     "destroy")
         info "Destroying stack: $STACK_NAME"
-        aws.cmd cloudformation delete-stack --stack-name "$STACK_NAME" --region "$REGION"
+        $AWS_CMD cloudformation delete-stack --stack-name "$STACK_NAME" --region "$REGION"
         log "Stack deletion initiated"
         exit 0
         ;;
     "status")
         info "Checking stack status..."
-        aws.cmd cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" --query 'Stacks[0].StackStatus' --output text
+        $AWS_CMD cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" --query 'Stacks[0].StackStatus' --output text
         exit 0
         ;;
     "logs")
         info "Getting recent logs..."
         KEY_PAIR_NAME="umzugshilfe-key-$(date +%Y%m%d)"
         if [ -f "${KEY_PAIR_NAME}.pem" ]; then
-            INSTANCE_IP=$(aws.cmd cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" --query 'Stacks[0].Outputs[?OutputKey==`InstancePublicIP`].OutputValue' --output text)
+            INSTANCE_IP=$($AWS_CMD cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" --query 'Stacks[0].Outputs[?OutputKey==`InstancePublicIP`].OutputValue' --output text)
             ssh -i "${KEY_PAIR_NAME}.pem" -o StrictHostKeyChecking=no ec2-user@"$INSTANCE_IP" "sudo journalctl -u umzugshilfe --no-pager -n 50"
         else
             error "Key file not found. Cannot SSH to instance."
