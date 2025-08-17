@@ -95,7 +95,17 @@ class UmzugshilfeAutomator {
 
   // Clicks the "Meine Jobs" link shown in the nav; falls back to direct URL if needed
   async goToMeineJobs() {
-    if (this.page.url().includes("/intern/meine-jobs")) return;
+    if (this.page.url().includes("/intern/meine-jobs")) {
+      this.page.reload({ waitUntil: "domcontentloaded" });
+
+      await this.page.waitForSelector(
+        "div.entry, div.list, form button#ctrl_accept",
+        {
+          timeout: 5000,
+        }
+      );
+      return;
+    }
 
     // If we’re not on any internal page yet, try landing page after login
     if (!/\/intern\//.test(this.page.url())) {
@@ -172,9 +182,7 @@ class UmzugshilfeAutomator {
     try {
       await this.goToMeineJobs();
 
-      const entry = this.page
-        .locator("div.entry")
-        .filter({ hasText: `#${jobId}` });
+      const entry = this.page.locator("div.entry").filter({ hasText: jobId });
       if ((await entry.count()) === 0) {
         console.log(`⚠️ Job #${jobId} not present on Meine Jobs`);
         return false;
