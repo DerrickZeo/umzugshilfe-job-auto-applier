@@ -15,7 +15,7 @@ package-lock.json
 .env.production.local
 config/secrets.json
 credentials.json
-.pem
+*.pem
 
 # AWS and deployment files
 .aws/
