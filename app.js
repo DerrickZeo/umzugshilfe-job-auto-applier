@@ -1,7 +1,5 @@
-// app.js - Simplified EC2 Application with SMTP for Maximum Speed
-// No database, no OAuth complexity - just pure competitive advantage
+// app.js - SIMPLIFIED: Details-only processing
 
-// Load environment variables first
 require("dotenv").config();
 
 const express = require("express");
@@ -15,6 +13,8 @@ class UmzugshilfeService {
     this.emailWatcher = new EmailWatcher();
 
     this.isProcessing = false;
+    this.processedJobs = new Set();
+    this.jobQueue = [];
     this.stats = {
       totalJobsProcessed: 0,
       successCount: 0,
@@ -26,121 +26,85 @@ class UmzugshilfeService {
     this.setupGracefulShutdown();
   }
 
-  setupExpress() {
-    this.app.use(express.json());
-
-    // Simple health check
-    this.app.get("/health", (req, res) => {
-      res.json({
-        status: "healthy",
-        uptime: Date.now() - this.stats.startTime,
-        browserReady: this.automator.isReady(),
-        emailConnected: this.emailWatcher.isConnected(),
-        smtpConfigured: !!process.env.EMAIL_ADDRESS,
-      });
-    });
-
-    // Basic stats
-    this.app.get("/stats", (req, res) => {
-      res.json({
-        ...this.stats,
-        uptime: Date.now() - this.stats.startTime,
-        isProcessing: this.isProcessing,
-        successRate:
-          this.stats.totalJobsProcessed > 0
-            ? Math.round(
-                (this.stats.successCount / this.stats.totalJobsProcessed) * 100
-              )
-            : 0,
-      });
-    });
-
-    // Manual job trigger for testing
-    this.app.post("/trigger", async (req, res) => {
-      const { jobIds } = req.body;
-      if (!jobIds || !Array.isArray(jobIds)) {
-        return res.status(400).json({ error: "Invalid jobIds array" });
-      }
+  setupGracefulShutdown() {
+    const shutdown = async (signal) => {
+      console.log(`\n🔔 Received ${signal}, shutting down...`);
 
       try {
-        const result = await this.handleNewJobs(jobIds);
-        res.json({ success: true, processed: result });
-      } catch (error) {
-        res.status(500).json({ error: error.message });
-      }
-    });
+        this.emailWatcher.stop();
 
-    // Test email sending
-    this.app.post("/test-email", async (req, res) => {
-      try {
-        await this.emailWatcher.sendTestEmail();
-        res.json({ success: true, message: "Test email sent successfully" });
+        let waitTime = 0;
+        while (this.isProcessing && waitTime < 30000) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          waitTime += 1000;
+        }
+
+        await this.automator.cleanup();
+        console.log("✅ Shutdown completed");
+        process.exit(0);
       } catch (error) {
-        res.status(500).json({ error: error.message });
+        console.error("❌ Error during shutdown:", error);
+        process.exit(1);
       }
-    });
+    };
+
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
+    process.on("SIGINT", () => shutdown("SIGINT"));
   }
 
-  async initialize() {
-    console.log("🚀 Initializing simplified Umzugshilfe Service with SMTP...");
-
-    try {
-      // Initialize browser and login
-      await this.automator.initialize();
-      console.log("✅ Browser ready and logged in");
-
-      // Initialize email watcher with SMTP
-      await this.emailWatcher.initialize();
-      console.log("✅ SMTP connection established");
-
-      // Start email monitoring
-      this.emailWatcher.startPolling(this.handleNewJobs.bind(this));
-      console.log("✅ Email monitoring active");
-
-      // Start Express server
-      const port = process.env.PORT || 3000;
-      this.app.listen(port, () => {
-        console.log(`🌐 Server running on port ${port}`);
-        console.log("🎯 Ready for lightning-fast job applications!");
-        console.log(
-          `📧 Monitoring emails from: ${
-            process.env.EMAIL_ADDRESS || "Not configured"
-          }`
-        );
-      });
-    } catch (error) {
-      console.error("❌ Failed to initialize:", error);
-      process.exit(1);
+  // SIMPLIFIED: Only handle job details, no more jobIds parameter
+  async handleNewJob(jobDetails) {
+    if (
+      !jobDetails ||
+      !jobDetails.date ||
+      !jobDetails.time ||
+      !jobDetails.zip
+    ) {
+      console.log("❌ Invalid job details provided");
+      return { results: { successful: [], failed: ["INVALID_DETAILS"] } };
     }
-  }
-
-  async handleNewJobs(jobIds) {
-    if (!jobIds || jobIds.length === 0) return;
 
     const startTime = Date.now();
-    console.log(`⚡ NEW JOBS: ${jobIds.join(", ")} - Processing immediately!`);
+    const jobKey = `${jobDetails.date}_${jobDetails.time}_${jobDetails.zip}`;
+
+    console.log(
+      `⚡ NEW JOB: ${jobDetails.date} ${jobDetails.time} in ${jobDetails.zip} ${
+        jobDetails.city || ""
+      } - Processing immediately!`
+    );
+
+    // Prevent duplicate processing
+    if (this.processedJobs.has(jobKey)) {
+      console.log(`🔄 Job ${jobKey} already processed, skipping...`);
+      return { results: { successful: [jobKey], failed: [] } };
+    }
+
+    // Mark as processed immediately
+    this.processedJobs.add(jobKey);
 
     if (this.isProcessing) {
-      console.log("⚠️ Already processing jobs, queuing...");
-      // Simple queue - just wait a bit and try again
-      setTimeout(() => this.handleNewJobs(jobIds), 1000);
-      return;
+      console.log("⚠️ Already processing a job, adding to queue...");
+      this.jobQueue.push({ jobDetails, startTime });
+      return { results: { successful: [], failed: [] }, queued: true };
     }
 
     this.isProcessing = true;
 
     try {
-      // Process jobs immediately
-      const results = await this.automator.processJobs(jobIds);
+      console.log("🔄 Processing job using details method...");
+      const success = await this.automator.applyToJobByDetails(jobDetails);
+
+      const results = {
+        successful: success ? [jobKey] : [],
+        failed: success ? [] : [jobKey],
+      };
 
       const responseTime = Date.now() - startTime;
 
-      // Update simple stats
-      this.stats.totalJobsProcessed += jobIds.length;
+      this.stats.totalJobsProcessed += 1;
       this.stats.successCount += results.successful.length;
       this.stats.failCount += results.failed.length;
 
-      // Send success notification via email
       if (results.successful.length > 0) {
         await this.emailWatcher.sendSuccessNotification(
           results.successful,
@@ -155,49 +119,138 @@ class UmzugshilfeService {
       return {
         responseTime,
         results,
+        method: "job_details",
         timestamp: new Date().toISOString(),
       };
     } catch (error) {
       console.error("❌ Job processing failed:", error);
-      this.stats.failCount += jobIds.length;
 
-      // Send error notification
-      await this.emailWatcher.sendErrorNotification(error, jobIds);
+      this.stats.failCount += 1;
+      await this.emailWatcher.sendErrorNotification(error, [jobKey]);
 
-      throw error;
+      return {
+        results: { successful: [], failed: [jobKey] },
+        error: error.message,
+      };
     } finally {
       this.isProcessing = false;
+      this.processQueuedJobs();
     }
   }
 
-  setupGracefulShutdown() {
-    const shutdown = async (signal) => {
-      console.log(`\n📡 Received ${signal}, shutting down...`);
+  // SIMPLIFIED: Process queued jobs
+  async processQueuedJobs() {
+    if (this.jobQueue.length > 0 && !this.isProcessing) {
+      const nextJob = this.jobQueue.shift();
+      console.log(`📦 Processing queued job...`);
+
+      setTimeout(() => {
+        this.handleNewJob(nextJob.jobDetails);
+      }, 1000);
+    }
+  }
+
+  setupExpress() {
+    this.app.use(express.json());
+
+    this.app.get("/health", (req, res) => {
+      res.json({
+        status: "healthy",
+        uptime: Date.now() - this.stats.startTime,
+        browserReady: this.automator.isReady(),
+        emailConnected: this.emailWatcher.isConnected(),
+        smtpConfigured: !!process.env.EMAIL_ADDRESS,
+        processing: "details_only", // Indicate simplified mode
+      });
+    });
+
+    this.app.get("/stats", (req, res) => {
+      res.json({
+        ...this.stats,
+        uptime: Date.now() - this.stats.startTime,
+        isProcessing: this.isProcessing,
+        queueLength: this.jobQueue.length,
+        processedJobsCount: this.processedJobs.size,
+        successRate:
+          this.stats.totalJobsProcessed > 0
+            ? Math.round(
+                (this.stats.successCount / this.stats.totalJobsProcessed) * 100
+              )
+            : 0,
+      });
+    });
+
+    // SIMPLIFIED: Manual trigger now only accepts job details
+    this.app.post("/trigger", async (req, res) => {
+      const { date, time, zip, city } = req.body;
+
+      if (!date || !time || !zip) {
+        return res.status(400).json({
+          error: "date, time, and zip are required fields",
+        });
+      }
+
+      const jobDetails = { date, time, zip, city };
 
       try {
-        // Stop email polling
-        this.emailWatcher.stop();
-
-        // Wait for current processing to complete (max 30s)
-        let waitTime = 0;
-        while (this.isProcessing && waitTime < 30000) {
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-          waitTime += 1000;
-        }
-
-        // Clean up browser
-        await this.automator.cleanup();
-
-        console.log("✅ Shutdown completed");
-        process.exit(0);
+        const result = await this.handleNewJob(jobDetails);
+        res.json({ success: true, processed: result });
       } catch (error) {
-        console.error("❌ Error during shutdown:", error);
-        process.exit(1);
+        res.status(500).json({ error: error.message });
       }
-    };
+    });
 
-    process.on("SIGTERM", () => shutdown("SIGTERM"));
-    process.on("SIGINT", () => shutdown("SIGINT"));
+    this.app.post("/test-email", async (req, res) => {
+      try {
+        await this.emailWatcher.sendTestEmail();
+        res.json({ success: true, message: "Test email sent successfully" });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+  }
+
+  async initialize() {
+    console.log(
+      "🚀 Initializing SIMPLIFIED Umzugshilfe Service (Details-Only Mode)..."
+    );
+
+    try {
+      await this.automator.initialize();
+      console.log("✅ Browser ready and logged in");
+
+      await this.emailWatcher.initialize();
+      console.log("✅ SMTP connection established");
+
+      // SIMPLIFIED: Pass the simplified handler that expects details object
+      this.emailWatcher.startPolling((details) => this.handleNewJob(details));
+      console.log("✅ Email monitoring active (details-only mode)");
+
+      setInterval(() => this.cleanupProcessedJobs(), 60000);
+
+      const port = process.env.PORT || 3000;
+      this.app.listen(port, () => {
+        console.log(`🌐 Server running on port ${port}`);
+        console.log("🎯 Ready for lightning-fast job applications!");
+        console.log("📋 Processing Mode: DETAILS ONLY (no ID extraction)");
+        console.log(
+          `📧 Monitoring emails from: ${
+            process.env.EMAIL_ADDRESS || "Not configured"
+          }`
+        );
+      });
+    } catch (error) {
+      console.error("❌ Failed to initialize:", error);
+      process.exit(1);
+    }
+  }
+
+  cleanupProcessedJobs() {
+    if (this.processedJobs.size > 1000) {
+      const jobsArray = Array.from(this.processedJobs);
+      this.processedJobs.clear();
+      jobsArray.slice(-500).forEach((job) => this.processedJobs.add(job));
+    }
   }
 }
 

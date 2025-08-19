@@ -1,5 +1,4 @@
-// src/lib/email-watcher-smtp.js
-// SMTP + IMAP watcher (push + fallback polling)
+// email-watcher-smtp.js - SIMPLIFIED: Details-only processing
 
 const nodemailer = require("nodemailer");
 const Imap = require("imap");
@@ -12,16 +11,20 @@ class EmailWatcher {
     // state flags
     this.smtpReady = false;
     this.imapReady = false;
-    this.connected = false; // renamed (avoid isConnected() name clash)
+    this.connected = false;
 
     this.jobHandler = null;
     this.reconnectTimer = null;
-    this.reconnectDelayMs = 5000; // backoff start (5s), max 60s
+    this.reconnectDelayMs = 5000;
 
     // polling
     this.pollingInterval = null;
-    this.pollingFrequency = 30000; // 30s safety poll
+    this.pollingFrequency = 15000;
     this.lastCheckTime = new Date();
+
+    // Job tracking for simplified processing
+    this.processedJobs = new Set();
+    this.emailRetryCount = new Map();
 
     this.config = {
       smtp: {
@@ -30,32 +33,271 @@ class EmailWatcher {
         secure: process.env.EMAIL_SECURE === "true" || false,
         auth: {
           user: process.env.EMAIL_ADDRESS,
-          pass: process.env.EMAIL_PASSWORD, // use a Gmail App Password
+          pass: process.env.EMAIL_PASSWORD,
         },
         tls: { rejectUnauthorized: false },
       },
       imap: {
         user: process.env.EMAIL_ADDRESS,
-        password: process.env.EMAIL_PASSWORD, // App Password
+        password: process.env.EMAIL_PASSWORD,
         host: "imap.gmail.com",
         port: 993,
         tls: true,
         tlsOptions: { rejectUnauthorized: false },
-        keepalive: true, // node-imap keeps IDLE alive
+        keepalive: true,
       },
     };
   }
 
-  // pass jobHandler in so push handler can call it
-  async initialize(jobHandler) {
-    console.log("🔧 Initializing SMTP email watcher...");
-    this.jobHandler = jobHandler;
+  async checkForNewEmails(jobHandler) {
+    if (!this.imapReady || !this.imapConnection || !this.connected) {
+      console.log("⚠️ IMAP not connected, skipping email check");
+      return;
+    }
+
+    if (!jobHandler || typeof jobHandler !== "function") {
+      console.error("❌ Invalid jobHandler provided to checkForNewEmails");
+      return;
+    }
+
+    await this.openInbox();
+
+    const searchCriteria = ["UNSEEN", ["FROM", "studenten-umzugshilfe.com"]];
+    const uids = await this.searchEmails(searchCriteria);
+    if (!uids.length) {
+      console.log("🔭 No new job emails found");
+      return;
+    }
+
+    console.log(`📧 Found ${uids.length} new job emails`);
+
+    for (const uid of uids) {
+      let shouldMarkAsRead = false;
+
+      try {
+        // SIMPLIFIED: Only extract details from email
+        const emailSubject = await this.getSubjectPlusBody(uid);
+        console.log(
+          `📄 Processing email ${uid}: ${emailSubject.substring(0, 150)}...`
+        );
+
+        const details = this.parseJobDetailsFromText(emailSubject);
+
+        if (details) {
+          console.log(
+            `📅 Found job: ${details.date} ${details.time} in ${details.zip} ${details.city}`
+          );
+
+          // Create unique key for this job
+          const jobKey = `${details.date}_${details.time}_${details.zip}`;
+
+          // Check if already processed
+          if (this.isJobAlreadyProcessed(jobKey)) {
+            console.log(`🔄 Job ${jobKey} already processed, skipping`);
+            shouldMarkAsRead = true;
+          } else {
+            // Process the job using details
+            const result = await jobHandler(details);
+            const success =
+              result && result.results && result.results.successful.length > 0;
+
+            if (success) {
+              console.log(`✅ Successfully processed job: ${jobKey}`);
+              shouldMarkAsRead = true;
+              this.markJobAsProcessed(jobKey);
+            } else {
+              console.log(`❌ Failed to process job: ${jobKey}`);
+              // Don't mark as read - let it retry later
+              const retryCount = this.getEmailRetryCount(uid);
+              if (retryCount >= 3) {
+                console.log(
+                  `⚠️ Max retries reached for ${uid}, marking as read`
+                );
+                shouldMarkAsRead = true;
+              } else {
+                this.incrementEmailRetryCount(uid);
+              }
+            }
+          }
+        } else {
+          console.log("❌ Could not extract job details from email");
+          console.log(`📝 Email subject: ${emailSubject}`);
+
+          // CRITICAL: Handle parsing failures to prevent infinite loops
+          const retryCount = this.getEmailRetryCount(uid);
+          if (retryCount >= 2) {
+            console.log(
+              `⚠️ Parsing failed ${retryCount} times, marking as read to prevent infinite loop`
+            );
+            shouldMarkAsRead = true;
+          } else {
+            console.log(
+              `🔄 Will retry parsing later (attempt ${retryCount + 1}/3)`
+            );
+            this.incrementEmailRetryCount(uid);
+          }
+        }
+      } catch (err) {
+        console.error(`❌ Error processing email ${uid}:`, err);
+
+        const retryCount = this.getEmailRetryCount(uid);
+        if (retryCount >= 2) {
+          console.log(
+            `⚠️ Processing failed ${retryCount} times, marking as read`
+          );
+          shouldMarkAsRead = true;
+        } else {
+          this.incrementEmailRetryCount(uid);
+        }
+      }
+
+      // Mark as read only if we should
+      if (shouldMarkAsRead) {
+        try {
+          await this.markAsRead(uid);
+          console.log(`✅ Marked email ${uid} as read`);
+          this.clearEmailRetryCount(uid);
+        } catch (markError) {
+          console.error(`❌ Failed to mark email as read:`, markError);
+        }
+      }
+    }
+
+    this.lastCheckTime = new Date();
+  }
+
+  // SIMPLIFIED: Parse ONLY from email subject line format
+  parseJobDetailsFromText(text) {
+    if (!text) {
+      console.log("❌ No text provided for parsing");
+      return null;
+    }
+
+    const cleanText = text.replace(/\s+/g, " ").trim();
+    console.log(`🔍 Parsing email subject: ${cleanText.substring(0, 300)}...`);
+
+    // ONLY SUBJECT FORMAT: "2 Umzugshelfer am 23.08.2025 ab 15:00 Uhr in 58452 Witten gesucht"
+    const subjectPattern =
+      /(\d+)\s+Umzugshelfer\s+am\s+(\d{1,2}\.\d{1,2}\.\d{4})\s+ab\s+(\d{1,2}:\d{2})\s+Uhr\s+in\s+(\d{5})\s+([A-ZÄÖÜa-zäöüß\-\.\s]+?)\s+gesucht/i;
+    const subjectMatch = cleanText.match(subjectPattern);
+
+    if (!subjectMatch) {
+      console.log("❌ Subject line doesn't match expected format");
+      console.log(
+        `📝 Expected: "X Umzugshelfer am DD.MM.YYYY ab HH:MM Uhr in 12345 City gesucht"`
+      );
+      console.log(`📝 Received: ${cleanText}`);
+      return null;
+    }
+
+    console.log("📧 Successfully matched subject line format");
+
+    const date = subjectMatch[2]; // 23.08.2025
+    const time = subjectMatch[3]; // 15:00
+    const zip = subjectMatch[4]; // 58452
+    const city = subjectMatch[5].trim(); // Witten
+
+    // Format time properly (ensure HH:MM format)
+    let formattedTime = time;
+    const timeParts = formattedTime.split(":");
+    if (timeParts.length === 2) {
+      const hours = timeParts[0].padStart(2, "0");
+      const minutes = timeParts[1];
+      formattedTime = `${hours}:${minutes}`;
+    }
+
+    // Clean city name (remove any trailing words, punctuation)
+    const cleanCity = city
+      .replace(/\s+(gesucht|neu|wartend|new)$/i, "")
+      .replace(/[.,!?]+$/, "")
+      .trim();
+
+    const result = {
+      date: date,
+      time: formattedTime,
+      zip: zip,
+      city: cleanCity,
+    };
+
+    console.log(`✅ Parsed from subject line:`, result);
+    return result;
+  }
+
+  // FIXED: Get ONLY the subject line for parsing
+  async getSubjectPlusBody(uid) {
+    return new Promise((resolve, reject) => {
+      const fetch = this.imapConnection.fetch(uid, {
+        bodies: ["HEADER.FIELDS (SUBJECT)"], // Only get subject
+        markSeen: false,
+      });
+
+      let subject = "";
+
+      fetch.on("message", (msg) => {
+        msg.on("body", (stream, info) => {
+          let chunk = "";
+          stream.on("data", (data) => {
+            chunk += data.toString("utf8");
+          });
+
+          stream.once("end", () => {
+            if (info.which === "HEADER.FIELDS (SUBJECT)") {
+              const subjectMatch = chunk.match(/Subject:\s*(.+?)(?:\r?\n|$)/i);
+              if (subjectMatch) {
+                subject = subjectMatch[1].trim();
+              }
+            }
+          });
+        });
+      });
+
+      fetch.once("error", reject);
+      fetch.once("end", () => {
+        console.log(`📄 Extracted subject: ${subject}`);
+        resolve(subject); // Return ONLY the subject line
+      });
+    });
+  }
+
+  isJobAlreadyProcessed(jobKey) {
+    return this.processedJobs.has(jobKey);
+  }
+
+  markJobAsProcessed(jobKey) {
+    this.processedJobs.add(jobKey);
+    if (this.processedJobs.size > 1000) {
+      const jobsArray = Array.from(this.processedJobs);
+      this.processedJobs.clear();
+      jobsArray.slice(-500).forEach((job) => this.processedJobs.add(job));
+    }
+  }
+
+  getEmailRetryCount(uid) {
+    return this.emailRetryCount.get(uid) || 0;
+  }
+
+  incrementEmailRetryCount(uid) {
+    const current = this.getEmailRetryCount(uid);
+    this.emailRetryCount.set(uid, current + 1);
+  }
+
+  clearEmailRetryCount(uid) {
+    this.emailRetryCount.delete(uid);
+  }
+
+  // Core IMAP and SMTP methods from original code
+  async initialize(jobHandler = null) {
+    console.log("📧 Initializing SMTP email watcher...");
+
+    if (jobHandler) {
+      this.jobHandler = jobHandler;
+    }
 
     if (!this.config.smtp.auth.user || !this.config.smtp.auth.pass) {
       throw new Error("EMAIL_ADDRESS and EMAIL_PASSWORD must be configured");
     }
 
-    // Try both SMTP flavors
+    // SMTP setup
     const smtpConfigs = [
       {
         name: "Gmail TLS (587)",
@@ -88,7 +330,7 @@ class EmailWatcher {
     let lastError;
     for (const { name, config } of smtpConfigs) {
       try {
-        console.log(`🔄 Trying ${name}...`);
+        console.log(`📧 Trying ${name}...`);
         this.transporter = nodemailer.createTransport(config);
         await Promise.race([
           this.transporter.verify(),
@@ -106,38 +348,22 @@ class EmailWatcher {
       }
     }
     if (!this.transporter) {
-      console.log(
-        "💡 SMTP Tips:\n  - Enable 2FA in Google\n  - Use an App Password\n  - Check firewall/VPN"
-      );
       throw new Error(
         `All SMTP configurations failed. Last error: ${lastError?.message}`
       );
     }
 
-    // --- IMAP (push) ---
-    console.log("📬 Initializing IMAP…");
+    // IMAP setup
+    console.log("📬 Initializing IMAP...");
     this.imapConnection = new Imap(this.config.imap);
     this.setupImapHandlers();
 
-    await this.connectImap(); // waits for 'ready'
-    await this.openInbox(); // select INBOX
-
-    // Push: trigger immediately on new mail (IDLE)
-    let busy = false; // simple debounce
-    this.imapConnection.on("mail", () => {
-      if (busy) return;
-      busy = true;
-      this.checkForNewEmails(jobHandler)
-        .catch((err) => console.error("IDLE error:", err))
-        .finally(() => {
-          busy = false;
-        });
-    });
+    await this.connectImap();
+    await this.openInbox();
 
     this.imapReady = true;
     this.connected = true;
     this.attachPush();
-    console.log("✅ IMAP connected");
     console.log("✅ Email watcher initialized (SMTP + IMAP push)");
   }
 
@@ -148,31 +374,32 @@ class EmailWatcher {
     this.imapConnection.on("error", (err) => {
       console.error("❌ IMAP connection error:", err);
       this.scheduleReconnect("error");
-      // this.connected = false;
-      // this.imapReady = false;
     });
     this.imapConnection.on("end", () => {
       console.log("📭 IMAP connection ended");
       this.scheduleReconnect("end");
-      //  this.connected = false;
-      // this.imapReady = false;
     });
   }
 
   attachPush() {
-    // debounce so we don't overlap scans
     let busy = false;
     this.imapConnection.on("mail", () => {
       if (busy) return;
       busy = true;
-      this.checkForNewEmails(this.jobHandler)
-        .catch((err) => console.error("IDLE handler error:", err))
-        .finally(() => (busy = false));
+
+      if (this.jobHandler) {
+        this.checkForNewEmails(this.jobHandler)
+          .catch((err) => console.error("IDLE handler error:", err))
+          .finally(() => (busy = false));
+      } else {
+        console.warn("⚠️ No jobHandler available for IMAP push notification");
+        busy = false;
+      }
     });
   }
 
   scheduleReconnect(reason) {
-    if (this.reconnectTimer) return; // already scheduled
+    if (this.reconnectTimer) return;
     this.connected = false;
     this.imapReady = false;
 
@@ -190,14 +417,13 @@ class EmailWatcher {
       await this._reconnectImap();
     }, this.reconnectDelayMs);
 
-    this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 60000); // cap at 60s
+    this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 60000);
   }
 
   async _reconnectImap() {
     try {
       this.imapConnection = new Imap({
         ...this.config.imap,
-        // keepalive helps after network blips / sleep
         keepalive: { interval: 30000, idleInterval: 300000, forceNoop: true },
       });
       this.setupImapHandlers();
@@ -207,11 +433,11 @@ class EmailWatcher {
 
       this.imapReady = true;
       this.connected = true;
-      this.reconnectDelayMs = 5000; // reset backoff
+      this.reconnectDelayMs = 5000;
       console.log("✅ IMAP reconnected");
     } catch (e) {
       console.error("❌ Reconnect failed:", e.message);
-      this.scheduleReconnect("retry"); // schedule next attempt
+      this.scheduleReconnect("retry");
     }
   }
 
@@ -235,56 +461,6 @@ class EmailWatcher {
     });
   }
 
-  async startPolling(jobHandler) {
-    console.log(`🔍 Starting email polling every ${this.pollingFrequency}ms`);
-    if (this.pollingInterval) clearInterval(this.pollingInterval);
-    this.pollingInterval = setInterval(() => {
-      this.checkForNewEmails(jobHandler).catch((err) =>
-        console.error("❌ Error during email polling:", err)
-      );
-    }, this.pollingFrequency);
-
-    // do an immediate scan as well
-    await this.checkForNewEmails(jobHandler);
-  }
-
-  async checkForNewEmails(jobHandler) {
-    if (!this.imapReady || !this.imapConnection || !this.connected) {
-      console.log("⚠️ IMAP not connected, skipping email check");
-      return;
-    }
-    await this.openInbox();
-
-    // UNSEEN + from domain
-    const searchCriteria = ["UNSEEN", ["FROM", "studenten-umzugshilfe.com"]];
-    const uids = await this.searchEmails(searchCriteria);
-    if (!uids.length) {
-      console.log("📭 No new job emails found");
-      return;
-    }
-
-    console.log(`📧 Found ${uids.length} new job emails`);
-    for (const uid of uids) {
-      try {
-        const jobIds = await this.extractJobIdsFromEmail(uid);
-        if (jobIds.length > 0) {
-          await jobHandler(jobIds); // your app handles applying
-        } else {
-          console.log("ℹ️ No numeric job IDs in this email (subject/body)");
-          // If you want the no-ID fallback by details, you can:
-          // const text = await this.getSubjectPlusBody(uid);
-          // const details = this.parseJobDetailsFromText(text);
-          // if (details) await jobHandler([], details);
-        }
-        await this.markAsRead(uid); // optional
-      } catch (err) {
-        console.error(`❌ Error processing email ${uid}:`, err);
-      }
-    }
-
-    this.lastCheckTime = new Date();
-  }
-
   async openInbox() {
     if (!this.imapConnection) throw new Error("IMAP not initialized");
     return new Promise((resolve, reject) => {
@@ -303,66 +479,33 @@ class EmailWatcher {
     });
   }
 
-  async extractJobIdsFromEmail(uid) {
-    return new Promise((resolve, reject) => {
-      const fetch = this.imapConnection.fetch(uid, {
-        bodies: ["HEADER.FIELDS (SUBJECT)", "TEXT"],
-        markSeen: false,
-      });
-
-      let buffer = "";
-      fetch.on("message", (msg) => {
-        msg.on("body", (stream) => {
-          let chunk = "";
-          stream.on("data", (d) => (chunk += d.toString("utf8")));
-          stream.once("end", () => {
-            buffer += "\n" + chunk;
-          });
-        });
-      });
-      fetch.once("error", reject);
-      fetch.once("end", () => {
-        const ids = new Set();
-
-        // "ID: 49768" / "#49768"
-        for (const m of buffer.matchAll(/(?:\bID[\s:–-]*|#)(\d{4,7})\b/gi))
-          ids.add(m[1]);
-
-        // URLs: .../job/49768 or .../jobs/49768
-        for (const m of buffer.matchAll(
-          /studenten-umzugshilfe\.com\/(?:job|jobs)\/(\d{4,7})/gi
-        ))
-          ids.add(m[1]);
-
-        const out = [...ids];
-        console.log(
-          out.length
-            ? `📧 Extracted job IDs: ${out.join(", ")}`
-            : "📧 No job IDs found in this email"
-        );
-        resolve(out);
-      });
-    });
-  }
-
-  // optional helper if you later want details matching (date, time, zip, city)
-  parseJobDetailsFromText(text) {
-    const s = (text || "").replace(/\s+/g, " ").trim();
-    const dateMatch = s.match(/\b(\d{2}\.\d{2}\.\d{4})\b/);
-    const timeMatch = s.match(/\b(\d{1,2}:\d{2})\b/);
-    const locMatch = s.match(/\b(\d{5})\s+([A-Za-zÄÖÜäöüß\-\.]+)\b/);
-    if (!dateMatch || !timeMatch || !locMatch) return null;
-    const [h, m] = timeMatch[1].split(":");
-    const time = `${String(h).padStart(2, "0")}:${m}`;
-    return { date: dateMatch[1], time, zip: locMatch[1], city: locMatch[2] };
-  }
-
   async markAsRead(uid) {
     return new Promise((resolve, reject) => {
       this.imapConnection.addFlags(uid, ["\\Seen"], (err) =>
         err ? reject(err) : resolve()
       );
     });
+  }
+
+  async startPolling(jobHandler) {
+    console.log(`🔍 Starting email polling every ${this.pollingFrequency}ms`);
+
+    if (jobHandler && !this.jobHandler) {
+      this.jobHandler = jobHandler;
+    }
+
+    if (this.pollingInterval) clearInterval(this.pollingInterval);
+    this.pollingInterval = setInterval(() => {
+      if (this.jobHandler) {
+        this.checkForNewEmails(this.jobHandler).catch((err) =>
+          console.error("❌ Error during email polling:", err)
+        );
+      }
+    }, this.pollingFrequency);
+
+    if (this.jobHandler) {
+      await this.checkForNewEmails(this.jobHandler);
+    }
   }
 
   async sendSuccessNotification(successfulJobs, responseTime) {
@@ -441,7 +584,6 @@ Timestamp: ${new Date().toISOString()}
     this.imapReady = false;
   }
 
-  // health helper used by your app.js
   isConnected() {
     return this.imapReady && this.connected;
   }
