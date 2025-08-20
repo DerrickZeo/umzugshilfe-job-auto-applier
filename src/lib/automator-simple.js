@@ -211,249 +211,349 @@ class UmzugshilfeAutomator {
     }
   }
 
+  // inside class
+  _escapeRegExp(s = "") {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  async _findEntryByLine({ date, time, zip, city }) {
+    const d = this._escapeRegExp(date);
+    const t = this._escapeRegExp(time);
+    const z = this._escapeRegExp(zip);
+    const c = city ? this._escapeRegExp(city).replace(/\s+/g, "\\s+") : null;
+
+    // tolerate optional “Uhr” and flexible spacing in city
+    const rx = c
+      ? new RegExp(
+          `\\bAm\\s+${d}\\s+um\\s+${t}(?:\\s+Uhr)?\\s+in\\s+${z}\\s+${c}\\b`,
+          "i"
+        )
+      : new RegExp(
+          `\\bAm\\s+${d}\\s+um\\s+${t}(?:\\s+Uhr)?\\s+in\\s+${z}\\b`,
+          "i"
+        );
+
+    // Prefer fresh jobs
+    const scopeNew = this.page.locator(
+      'div.entry[data-status="new"], div.entry[data-status="neu"]'
+    );
+    const scopeAll = this.page.locator("div.entry");
+
+    let entry = scopeNew.filter({ hasText: rx });
+    if ((await entry.count()) === 0) entry = scopeAll.filter({ hasText: rx });
+
+    return (await entry.count()) ? entry.first() : null;
+  }
+
   // CORRECTED: Convert email format to exact website format
+  // inside class
   async applyToJobByDetails({ date, time, zip, city }) {
-    try {
+    await this.goToMeineJobs();
+
+    const entry = await this._findEntryByLine({ date, time, zip, city });
+    if (!entry) {
       console.log(
-        `🔍 Looking for job: ${date} ${time} in ${zip} ${city || ""}`
+        `❌ No row found for: Am ${date} um ${time} in ${zip} ${city || ""}`
       );
-
-      await this.goToMeineJobs();
-
-      // CRITICAL FIX: Correct format conversion
-      // Email:   "am 23.08.2025 ab 15:00 Uhr in 58452 Witten"
-      // Website: "Am 23.08.2025 um 15:00 in 58452 Witten"
-
-      const searchPatterns = [
-        `Am ${date} um ${time} in ${zip} ${city}`, // Exact website format
-        `Am ${date} um ${time} in ${zip}`, // Without city (safer)
-        `${date} um ${time} in ${zip} ${city}`, // Without "Am" prefix
-        `${date} um ${time} in ${zip}`, // Minimal safe pattern
-        `${date}.*${time}.*${zip}`, // Flexible regex pattern
-        `${date}.*${zip}.*${city}`, // Date + location only
-      ];
-
-      let matchingEntry = null;
-      let usedPattern = "";
-
-      // Try exact pattern matching first
-      for (const pattern of searchPatterns) {
-        console.log(`🔍 Trying pattern: "${pattern}"`);
-
-        // Look for entries with status "new" or "neu"
-        const entries = this.page.locator(
-          'div.entry[data-status="new"], div.entry[data-status="neu"]'
-        );
-        const filteredEntries = entries.filter({ hasText: pattern });
-        const count = await filteredEntries.count();
-
-        console.log(`📊 Found ${count} entries matching pattern`);
-
-        if (count > 0) {
-          matchingEntry = filteredEntries.first();
-          usedPattern = pattern;
-          console.log(`✅ Found match using pattern: "${pattern}"`);
-          break;
-        }
-      }
-
-      // ENHANCED: More aggressive partial matching if exact fails
-      if (!matchingEntry) {
-        console.log(
-          "🔍 No exact match found, trying enhanced partial matching..."
-        );
-
-        const allNewEntries = this.page.locator(
-          'div.entry[data-status="new"], div.entry[data-status="neu"]'
-        );
-        const entryCount = await allNewEntries.count();
-
-        console.log(
-          `📋 Checking ${entryCount} new entries for partial matches...`
-        );
-
-        for (let i = 0; i < entryCount; i++) {
-          const entry = allNewEntries.nth(i);
-          const entryText = await entry.textContent();
-
-          console.log(`📄 Entry ${i + 1}: ${entryText?.substring(0, 150)}...`);
-
-          if (entryText) {
-            // Try multiple matching strategies
-            const hasDate = entryText.includes(date);
-            const hasTime = entryText.includes(time);
-            const hasZip = entryText.includes(zip);
-            const hasCity = city
-              ? entryText.toLowerCase().includes(city.toLowerCase())
-              : true;
-
-            console.log(
-              `🔍 Match check - Date:${hasDate} Time:${hasTime} Zip:${hasZip} City:${hasCity}`
-            );
-
-            // STRATEGY 1: All three main elements (date, time, zip)
-            if (hasDate && hasTime && hasZip) {
-              console.log(`🎯 Found strong partial match in entry ${i + 1}!`);
-              matchingEntry = entry;
-              usedPattern = "strong_partial_match";
-              break;
-            }
-
-            // STRATEGY 2: Date and zip (time might be formatted differently)
-            if (hasDate && hasZip && hasCity) {
-              console.log(`🎯 Found good partial match in entry ${i + 1}!`);
-              matchingEntry = entry;
-              usedPattern = "good_partial_match";
-              break;
-            }
-
-            // STRATEGY 3: Just date and zip (most reliable)
-            if (hasDate && hasZip) {
-              console.log(`🎯 Found basic partial match in entry ${i + 1}!`);
-              matchingEntry = entry;
-              usedPattern = "basic_partial_match";
-              // Don't break - keep looking for better matches
-            }
-          }
-        }
-      }
-
-      if (!matchingEntry) {
-        console.log(
-          `❌ No matching job found for: ${date} ${time} in ${zip} ${
-            city || ""
-          }`
-        );
-        await this._debugAvailableEntries();
-        return false;
-      }
-
-      console.log(`✅ Found matching entry using: ${usedPattern}`);
-
-      const statusBefore =
-        (await matchingEntry.getAttribute("data-status")) || "";
-      console.log(`📋 Job status: ${statusBefore}`);
-
-      const result = await this._submitAcceptInEntry(
-        matchingEntry,
-        statusBefore
-      );
-
-      if (result) {
-        console.log(
-          `✅ Successfully applied to job: ${date} ${time} in ${zip} ${
-            city || ""
-          }`
-        );
-      } else {
-        console.log(
-          `❌ Failed to apply to job: ${date} ${time} in ${zip} ${city || ""}`
-        );
-      }
-
-      return result;
-    } catch (error) {
-      console.error(`❌ Error in applyToJobByDetails:`, error.message);
-      await this._maybeScreenshot(`details-${date}-${time}-${zip}`);
       return false;
     }
+
+    const before = (await entry.getAttribute("data-status")) || "";
+    return this._submitAcceptInEntry(entry, before);
   }
+
+  // async applyToJobByDetails({ date, time, zip, city }) {
+  //   try {
+  //     console.log(
+  //       `🔍 Looking for job: ${date} ${time} in ${zip} ${city || ""}`
+  //     );
+
+  //     await this.goToMeineJobs();
+
+  //     // CRITICAL FIX: Correct format conversion
+  //     // Email:   "am 23.08.2025 ab 15:00 Uhr in 58452 Witten"
+  //     // Website: "Am 23.08.2025 um 15:00 in 58452 Witten"
+
+  //     const searchPatterns = [
+  //       `Am ${date} um ${time} in ${zip} ${city}`, // Exact website format
+  //       `Am ${date} um ${time} in ${zip}`, // Without city (safer)
+  //       `${date} um ${time} in ${zip} ${city}`, // Without "Am" prefix
+  //       `${date} um ${time} in ${zip}`, // Minimal safe pattern
+  //       `${date}.*${time}.*${zip}`, // Flexible regex pattern
+  //       `${date}.*${zip}.*${city}`, // Date + location only
+  //     ];
+
+  //     let matchingEntry = null;
+  //     let usedPattern = "";
+
+  //     // Try exact pattern matching first
+  //     for (const pattern of searchPatterns) {
+  //       console.log(`🔍 Trying pattern: "${pattern}"`);
+
+  //       // Look for entries with status "new" or "neu"
+  //       const entries = this.page.locator(
+  //         'div.entry[data-status="new"], div.entry[data-status="neu"]'
+  //       );
+  //       const filteredEntries = entries.filter({ hasText: pattern });
+  //       const count = await filteredEntries.count();
+
+  //       console.log(`📊 Found ${count} entries matching pattern`);
+
+  //       if (count > 0) {
+  //         matchingEntry = filteredEntries.first();
+  //         usedPattern = pattern;
+  //         console.log(`✅ Found match using pattern: "${pattern}"`);
+  //         break;
+  //       }
+  //     }
+
+  //     // ENHANCED: More aggressive partial matching if exact fails
+  //     if (!matchingEntry) {
+  //       console.log(
+  //         "🔍 No exact match found, trying enhanced partial matching..."
+  //       );
+
+  //       const allNewEntries = this.page.locator(
+  //         'div.entry[data-status="new"], div.entry[data-status="neu"]'
+  //       );
+  //       const entryCount = await allNewEntries.count();
+
+  //       console.log(
+  //         `📋 Checking ${entryCount} new entries for partial matches...`
+  //       );
+
+  //       for (let i = 0; i < entryCount; i++) {
+  //         const entry = allNewEntries.nth(i);
+  //         const entryText = await entry.textContent();
+
+  //         console.log(`📄 Entry ${i + 1}: ${entryText?.substring(0, 150)}...`);
+
+  //         if (entryText) {
+  //           // Try multiple matching strategies
+  //           const hasDate = entryText.includes(date);
+  //           const hasTime = entryText.includes(time);
+  //           const hasZip = entryText.includes(zip);
+  //           const hasCity = city
+  //             ? entryText.toLowerCase().includes(city.toLowerCase())
+  //             : true;
+
+  //           console.log(
+  //             `🔍 Match check - Date:${hasDate} Time:${hasTime} Zip:${hasZip} City:${hasCity}`
+  //           );
+
+  //           // STRATEGY 1: All three main elements (date, time, zip)
+  //           if (hasDate && hasTime && hasZip) {
+  //             console.log(`🎯 Found strong partial match in entry ${i + 1}!`);
+  //             matchingEntry = entry;
+  //             usedPattern = "strong_partial_match";
+  //             break;
+  //           }
+
+  //           // STRATEGY 2: Date and zip (time might be formatted differently)
+  //           if (hasDate && hasZip && hasCity) {
+  //             console.log(`🎯 Found good partial match in entry ${i + 1}!`);
+  //             matchingEntry = entry;
+  //             usedPattern = "good_partial_match";
+  //             break;
+  //           }
+
+  //           // STRATEGY 3: Just date and zip (most reliable)
+  //           if (hasDate && hasZip) {
+  //             console.log(`🎯 Found basic partial match in entry ${i + 1}!`);
+  //             matchingEntry = entry;
+  //             usedPattern = "basic_partial_match";
+  //             // Don't break - keep looking for better matches
+  //           }
+  //         }
+  //       }
+  //     }
+
+  //     if (!matchingEntry) {
+  //       console.log(
+  //         `❌ No matching job found for: ${date} ${time} in ${zip} ${
+  //           city || ""
+  //         }`
+  //       );
+  //       await this._debugAvailableEntries();
+  //       return false;
+  //     }
+
+  //     console.log(`✅ Found matching entry using: ${usedPattern}`);
+
+  //     const statusBefore =
+  //       (await matchingEntry.getAttribute("data-status")) || "";
+  //     console.log(`📋 Job status: ${statusBefore}`);
+
+  //     const result = await this._submitAcceptInEntry(
+  //       matchingEntry,
+  //       statusBefore
+  //     );
+
+  //     if (result) {
+  //       console.log(
+  //         `✅ Successfully applied to job: ${date} ${time} in ${zip} ${
+  //           city || ""
+  //         }`
+  //       );
+  //     } else {
+  //       console.log(
+  //         `❌ Failed to apply to job: ${date} ${time} in ${zip} ${city || ""}`
+  //       );
+  //     }
+
+  //     return result;
+  //   } catch (error) {
+  //     console.error(`❌ Error in applyToJobByDetails:`, error.message);
+  //     await this._maybeScreenshot(`details-${date}-${time}-${zip}`);
+  //     return false;
+  //   }
+  // }
 
   // FIXED: Better submit handling with corrected syntax
+  // inside class
   async _submitAcceptInEntry(entry, statusBefore = "") {
+    const accept = entry.locator(`
+      button#ctrl_accept,
+      button[name="accept"],
+      input[type="submit"][name="accept"],
+      button:has-text("Job annehmen"),
+      button:has-text("Annehmen"),
+      a:has-text("Job annehmen"),
+      a:has-text("Annehmen")
+    `);
+
+    const n = await accept.count();
+    console.log(`🔘 accept controls found: ${n}`);
+    if (!n) return false;
+
+    await accept.first().scrollIntoViewIfNeeded();
+
+    // Most rows do a full page POST → navigation
     try {
-      const form = entry.locator("form");
-
-      const submit = form.locator(`
-        button#ctrl_accept,
-        button[name="accept"], 
-        input[type="submit"][name="accept"],
-        button:has-text("Job annehmen"),
-        button:has-text("annehmen"),
-        button.submit
-      `);
-
-      const submitCount = await submit.count();
-      console.log(`🔘 Found ${submitCount} submit buttons`);
-
-      if (submitCount === 0) {
-        console.log("⚠️ No accept button found");
-        const formHTML = await form
-          .innerHTML()
-          .catch(() => "Could not get HTML");
-        console.log("🔍 Form HTML:", formHTML.substring(0, 300));
-        return false;
-      }
-
-      console.log("🚀 Clicking accept button...");
-
-      // Try multiple click strategies
-      try {
-        await Promise.all([
-          this.page.waitForNavigation({
-            waitUntil: "domcontentloaded",
-            timeout: 15000,
-          }),
-          submit.first().click(),
-        ]);
-      } catch (navError) {
-        console.warn("⚠️ Navigation wait failed, trying direct click...");
-        await submit.first().click();
-        await this.page.waitForTimeout(2000);
-      }
-
-      console.log("✅ Click completed");
-
-      // Wait for changes
-      await this.page.waitForTimeout(1000);
-
-      // Check for success indicators
-      const stillThere = await entry.count();
-      if (!stillThere) {
-        console.log("✅ Entry disappeared - success!");
-        return true;
-      }
-
-      const statusAfter =
-        (await entry.first().getAttribute("data-status")) || "";
-      if (statusBefore !== statusAfter) {
-        console.log(`✅ Status changed: '${statusBefore}' → '${statusAfter}'`);
-        return true;
-      }
-
-      const successIndicators = await entry
-        .locator(
-          `
-        button:has-text("x"), 
-        .btn.red, 
-        .accepted-state,
-        [data-status="accepted"],
-        [data-status="angenommen"]
-      `
-        )
-        .count();
-
-      if (successIndicators > 0) {
-        console.log("✅ Found success indicator");
-        return true;
-      }
-
-      const buttonDisabled = !(await submit
+      await Promise.all([
+        this.page.waitForNavigation({
+          waitUntil: "domcontentloaded",
+          timeout: 15000,
+        }),
+        accept.first().click({ timeout: 8000 }),
+      ]);
+    } catch {
+      // If no navigation (rare), still try to detect state change
+      await accept
         .first()
-        .isEnabled()
-        .catch(() => true));
-      if (buttonDisabled) {
-        console.log("✅ Button disabled - likely successful");
-        return true;
-      }
-
-      console.log("⚠️ No clear success indication");
-      return false;
-    } catch (error) {
-      console.error(`❌ Error in submit: ${error.message}`);
-      return false;
+        .click({ timeout: 8000 })
+        .catch(() => {});
+      await this.page.waitForTimeout(1200);
     }
+
+    // Re-locate the same entry by its DOM ref and check if it changed/disappeared
+    const stillThere = await entry.count();
+    if (!stillThere) return true; // entry re-rendered/removed → success
+
+    const after = (await entry.first().getAttribute("data-status")) || "";
+    if (statusBefore !== after) return true;
+
+    // Fallback: check for a red “cancel”/X button (many UIs show that only after success)
+    const hasCancel = await entry
+      .locator('button[name="cancel"], .btn.red, button:has-text("x")')
+      .count();
+    return hasCancel > 0;
   }
+
+  // async _submitAcceptInEntry(entry, statusBefore = "") {
+  //   try {
+  //     const form = entry.locator("form");
+
+  //     const submit = form.locator(`
+  //       button#ctrl_accept,
+  //       button[name="accept"],
+  //       input[type="submit"][name="accept"],
+  //       button:has-text("Job annehmen"),
+  //       button:has-text("annehmen"),
+  //       button.submit
+  //     `);
+
+  //     const submitCount = await submit.count();
+  //     console.log(`🔘 Found ${submitCount} submit buttons`);
+
+  //     if (submitCount === 0) {
+  //       console.log("⚠️ No accept button found");
+  //       const formHTML = await form
+  //         .innerHTML()
+  //         .catch(() => "Could not get HTML");
+  //       console.log("🔍 Form HTML:", formHTML.substring(0, 300));
+  //       return false;
+  //     }
+
+  //     console.log("🚀 Clicking accept button...");
+
+  //     // Try multiple click strategies
+  //     try {
+  //       await Promise.all([
+  //         this.page.waitForNavigation({
+  //           waitUntil: "domcontentloaded",
+  //           timeout: 15000,
+  //         }),
+  //         submit.first().click(),
+  //       ]);
+  //     } catch (navError) {
+  //       console.warn("⚠️ Navigation wait failed, trying direct click...");
+  //       await submit.first().click();
+  //       await this.page.waitForTimeout(2000);
+  //     }
+
+  //     console.log("✅ Click completed");
+
+  //     // Wait for changes
+  //     await this.page.waitForTimeout(1000);
+
+  //     // Check for success indicators
+  //     const stillThere = await entry.count();
+  //     if (!stillThere) {
+  //       console.log("✅ Entry disappeared - success!");
+  //       return true;
+  //     }
+
+  //     const statusAfter =
+  //       (await entry.first().getAttribute("data-status")) || "";
+  //     if (statusBefore !== statusAfter) {
+  //       console.log(`✅ Status changed: '${statusBefore}' → '${statusAfter}'`);
+  //       return true;
+  //     }
+
+  //     const successIndicators = await entry
+  //       .locator(
+  //         `
+  //       button:has-text("x"),
+  //       .btn.red,
+  //       .accepted-state,
+  //       [data-status="accepted"],
+  //       [data-status="angenommen"]
+  //     `
+  //       )
+  //       .count();
+
+  //     if (successIndicators > 0) {
+  //       console.log("✅ Found success indicator");
+  //       return true;
+  //     }
+
+  //     const buttonDisabled = !(await submit
+  //       .first()
+  //       .isEnabled()
+  //       .catch(() => true));
+  //     if (buttonDisabled) {
+  //       console.log("✅ Button disabled - likely successful");
+  //       return true;
+  //     }
+
+  //     console.log("⚠️ No clear success indication");
+  //     return false;
+  //   } catch (error) {
+  //     console.error(`❌ Error in submit: ${error.message}`);
+  //     return false;
+  //   }
+  // }
 
   // ADDED: Debug helper to see available entries
   async _debugAvailableEntries() {

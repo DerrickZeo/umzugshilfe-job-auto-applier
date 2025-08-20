@@ -3,6 +3,45 @@
 const nodemailer = require("nodemailer");
 const Imap = require("imap");
 
+// Minimal RFC-2047 decoder for Q/B encoded words in Subject
+const iconv = require("iconv-lite");
+
+// RFC-2047 decoder with proper charset handling (UTF-8, ISO-8859-1, etc.)
+function decodeRfc2047(subject) {
+  if (!subject) return "";
+
+  return subject.replace(
+    /=\?([^?]+)\?([bBqQ])\?([^?]*)\?=/g,
+    (_, charset, enc, data) => {
+      try {
+        const cs = String(charset || "").toLowerCase();
+
+        if (enc.toLowerCase() === "b") {
+          // Base64 → bytes → decode with charset
+          const buf = Buffer.from(data, "base64");
+          return iconv.decode(buf, cs);
+        } else {
+          // Q-encoding: underscores => spaces, =HH hex → bytes
+          let bytes = data
+            .replace(/_/g, " ")
+            .replace(/=([0-9A-Fa-f]{2})/g, (_, h) =>
+              String.fromCharCode(parseInt(h, 16))
+            );
+          // bytes (latin1) → decode with charset
+          const buf = Buffer.from(bytes, "latin1");
+          return iconv.decode(buf, cs);
+        }
+      } catch {
+        // If decoding fails, return raw chunk
+        return data;
+      }
+    }
+  );
+}
+
+// helper: zero-pad DD/MM/HH
+const z2 = (n) => String(n).padStart(2, "0");
+
 class EmailWatcher {
   constructor() {
     this.transporter = null;
@@ -48,6 +87,10 @@ class EmailWatcher {
       },
     };
   }
+  // Details-only mode (no numeric IDs from body)
+  async extractJobIdsFromEmail(/* uid */) {
+    return [];
+  }
 
   async checkForNewEmails(jobHandler) {
     if (!this.imapReady || !this.imapConnection || !this.connected) {
@@ -62,7 +105,7 @@ class EmailWatcher {
 
     await this.openInbox();
 
-    const searchCriteria = ["SEEN", ["FROM", "studenten-umzugshilfe.com"]];
+    const searchCriteria = ["UNSEEN", ["FROM", "studenten-umzugshilfe.com"]];
     const uids = await this.searchEmails(searchCriteria);
     if (!uids.length) {
       const now = new Date();
@@ -81,202 +124,218 @@ class EmailWatcher {
     console.log(`📧 Found ${uids.length} new job emails`);
 
     for (const uid of uids) {
-      let shouldMarkAsRead = false;
-
       try {
-        // SIMPLIFIED: Only extract details from email
-        const emailSubject = await this.getSubjectPlusBody(uid);
-        console.log(
-          `📄 Processing email ${uid}: ${emailSubject.substring(0, 150)}...`
-        );
+        // Get decoded subject + INTERNALDATE
+        const { subject, internalDate } = await this.getSubjectAndDate(uid);
+        console.log(`📧 Subject: ${subject}`);
 
-        const details = this.parseJobDetailsFromText(emailSubject);
+        // Try job IDs first if you still support ID flow (optional)
 
+        const details = this.parseJobDetailsFromSubject(subject, internalDate);
         if (details) {
-          console.log(
-            `📅 Found job: ${details.date} ${details.time} in ${details.zip} ${details.city}`
-          );
-
-          // Create unique key for this job
-          const jobKey = `${details.date}_${details.time}_${details.zip}`;
-
-          // Check if already processed
-          if (this.isJobAlreadyProcessed(jobKey)) {
-            console.log(`🔄 Job ${jobKey} already processed, skipping`);
-            shouldMarkAsRead = true;
-          } else {
-            // Process the job using details
-            const result = await jobHandler(details);
-            const success =
-              result && result.results && result.results.successful.length > 0;
-
-            if (success) {
-              console.log(`✅ Successfully processed job: ${jobKey}`);
-              shouldMarkAsRead = true;
-              this.markJobAsProcessed(jobKey);
-            } else {
-              console.log(`❌ Failed to process job: ${jobKey}`);
-              // Don't mark as read - let it retry later
-              const retryCount = this.getEmailRetryCount(uid);
-              if (retryCount >= 3) {
-                console.log(
-                  `⚠️ Max retries reached for ${uid}, marking as read`
-                );
-                shouldMarkAsRead = true;
-              } else {
-                this.incrementEmailRetryCount(uid);
-              }
-            }
-          }
+          console.log("➡️ Passing details to handler:", details);
+          await jobHandler(details); // ✅ single-argument: details object
+          await this.markAsRead(uid);
         } else {
-          console.log("❌ Could not extract job details from email");
-          console.log(`📝 Email subject: ${emailSubject}`);
-
-          // CRITICAL: Handle parsing failures to prevent infinite loops
-          const retryCount = this.getEmailRetryCount(uid);
-          if (retryCount >= 2) {
-            console.log(
-              `⚠️ Parsing failed ${retryCount} times, marking as read to prevent infinite loop`
-            );
-            shouldMarkAsRead = true;
-          } else {
-            console.log(
-              `🔄 Will retry parsing later (attempt ${retryCount + 1}/3)`
-            );
-            this.incrementEmailRetryCount(uid);
-          }
+          console.log("❌ Could not extract job details from subject");
+          console.log("🧵 Email subject:", subject);
         }
       } catch (err) {
         console.error(`❌ Error processing email ${uid}:`, err);
-
-        const retryCount = this.getEmailRetryCount(uid);
-        if (retryCount >= 2) {
-          console.log(
-            `⚠️ Processing failed ${retryCount} times, marking as read`
-          );
-          shouldMarkAsRead = true;
-        } else {
-          this.incrementEmailRetryCount(uid);
-        }
-      }
-
-      // Mark as read only if we should
-      if (shouldMarkAsRead) {
-        try {
-          await this.markAsRead(uid);
-          console.log(`✅ Marked email ${uid} as read`);
-          this.clearEmailRetryCount(uid);
-        } catch (markError) {
-          console.error(`❌ Failed to mark email as read:`, markError);
-        }
       }
     }
 
     this.lastCheckTime = new Date();
   }
 
-  parseJobDetailsFromText(text) {
-    if (!text) return null;
+  async getSubjectAndDate(uid) {
+    return new Promise((resolve, reject) => {
+      const f = this.imapConnection.fetch(uid, {
+        bodies: "HEADER.FIELDS (SUBJECT)",
+        struct: false,
+      });
 
-    // normalize whitespace
-    const s = text.replace(/\s+/g, " ").trim();
+      let raw = "";
+      let internalDate = null;
 
-    // 1) DATE (DD.MM.YYYY, day/month can be 1–2 digits)
-    const dateMatch = s.match(/\b(\d{1,2}\.\d{1,2}\.\d{4})\b/);
-    if (!dateMatch) return null;
-    let date = dateMatch[1];
+      f.on("message", (msg) => {
+        msg.on("body", (stream) => {
+          stream.on("data", (d) => (raw += d.toString("utf8")));
+        });
+        msg.on("attributes", (attrs) => {
+          // IMAP INTERNALDATE → a JS Date
+          internalDate =
+            attrs.date instanceof Date ? attrs.date : new Date(attrs.date);
+        });
+      });
 
-    // zero-pad day/month so site text matches exactly
-    {
-      const [d, m, y] = date.split(".");
-      date = `${d.padStart(2, "0")}.${m.padStart(2, "0")}.${y}`;
-    }
+      f.once("error", reject);
+      f.once("end", () => {
+        // Capture Subject plus any folded continuation lines up to next header
+        const m = raw.match(/Subject:\s*([\s\S]*?)\r?\n(?=[A-Za-z-]+:|$)/i);
+        let subjRaw = m ? m[1] : "";
+        // Unfold: join CRLF + (space|tab) continuations
+        subjRaw = subjRaw.replace(/\r?\n[ \t]+/g, " ").trim();
+        let subject = decodeRfc2047(subjRaw).trim();
+        subject = subject.replace(/\bU\s+hr\b/gi, "Uhr"); // "U hr" → "Uhr"
+        // normalize spacing
+        subject = subject.replace(/\s+/g, " ").trim();
 
-    // 2) TIME (look for “ab/um HH[:MM] [Uhr]”; minutes optional; “Uhr” optional)
-    // we don’t require a single full match—just pick the first plausible time token
-    let hh = null,
-      mm = null;
-    // prefer time near the word "Uhr" or after "ab/um"
-    let t = s.match(/(?:\b(?:ab|um)\s+)?(\d{1,2})(?::(\d{2}))?\s*(?:Uhr)?/i);
-    if (t) {
-      hh = t[1];
-      mm = t[2] || "00";
-    }
-    if (!hh) return null; // time is required to construct the platform needle
-
-    const time = `${String(hh).padStart(2, "0")}:${mm}`;
-
-    // 3) ZIP + CITY
-    // Find a 5-digit ZIP then take the following text up to "gesucht" or end.
-    // Keep it permissive for German names (umlauts, hyphens, spaces, dots, apostrophes).
-    const locMatch = s.match(
-      /\b(\d{5})\s+([A-Za-zÄÖÜäöüß\-.'()\s]+?)(?:\s+gesucht\b|$)/
-    );
-    if (!locMatch) return null;
-
-    const zip = locMatch[1];
-    const city = locMatch[2].trim().replace(/\s+/g, " ");
-
-    return { date, time, zip, city };
+        resolve({ subject, internalDate });
+      });
+    });
   }
 
-  // SIMPLIFIED: Parse ONLY from email subject line format
-  // parseJobDetailsFromText(text) {
-  //   if (!text) {
-  //     console.log("❌ No text provided for parsing");
-  //     return null;
+  // parseJobDetailsFromSubject(subject, internalDate = new Date()) {
+  //   if (!subject) return null;
+  //   const s = subject.replace(/\s+/g, " ").trim();
+
+  //   // Ignore non-job subjects quickly
+  //   if (/registrierung|registration|verify|bestätigen/i.test(s)) return null;
+
+  //   // --- DATE ---
+  //   // a) DD.MM.YYYY
+  //   let dateStr = null;
+  //   let m = s.match(/\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b/);
+  //   if (m) {
+  //     const [, d, mo, y] = m;
+  //     dateStr = `${z2(d)}.${z2(mo)}.${y}`;
+  //   } else {
+  //     // b) DD.MM.  (no year) → use INTERNALDATE's year
+  //     m = s.match(/\b(\d{1,2})\.(\d{1,2})\.?\b/);
+  //     if (m) {
+  //       const [, d, mo] = m;
+  //       const y =
+  //         internalDate instanceof Date
+  //           ? internalDate.getFullYear()
+  //           : new Date().getFullYear();
+  //       dateStr = `${z2(d)}.${z2(mo)}.${y}`;
+  //     }
+  //   }
+  //   if (!dateStr) return null;
+
+  //   // --- TIME ---
+  //   // prefer H:MM or H.MM; else H (→ :00). "ab/um" and "Uhr" optional.
+  //   let hh = null,
+  //     mm = null;
+
+  //   // look for H:MM
+  //   let t = s.match(/\b(\d{1,2}):(\d{2})\b/);
+  //   if (t) {
+  //     hh = t[1];
+  //     mm = t[2];
   //   }
 
-  //   const cleanText = text.replace(/\s+/g, " ").trim();
-  //   console.log(`🔍 Parsing email subject: ${cleanText.substring(0, 300)}...`);
-
-  //   // ONLY SUBJECT FORMAT: "2 Umzugshelfer am 23.08.2025 ab 15:00 Uhr in 58452 Witten gesucht"
-  //   // const subjectPattern = /(\d+)\s+Umzugshelfer\s+am\s+(\d{1,2}\.\d{1,2}\.\d{4})\s+ab\s+(\d{1,2}:\d{2})\s+Uhr\s+in\s+(\d{5})\s+([A-ZÄÖÜa-zäöüß\-\.\s]+?)\s+gesucht/i;
-  //   const subjectPattern =
-  //     /(?<count>\d+)\s+Umzugshelfer\s+am\s+(?<date>\d{1,2}\.\d{1,2}\.\d{4})\s+(?:(?:ab|um)\s+)?(?<hour>\d{1,2})(?::(?<minute>\d{2}))?\s*(?:Uhr)?\s+in\s+(?<zip>\d{5})\s+(?<city>[\p{L}\-.'()/\s]+?)\s+gesucht/iu;
-  //   const subjectMatch = cleanText.match(subjectPattern);
-
-  //   if (!subjectMatch) {
-  //     console.log("❌ Subject line doesn't match expected format");
-  //     console.log(
-  //       `📝 Expected: "X Umzugshelfer am DD.MM.YYYY ab HH:MM Uhr in 12345 City gesucht"`
-  //     );
-  //     console.log(`📝 Received: ${cleanText}`);
-  //     return null;
+  //   // else look for H.MM (German style)
+  //   if (!hh) {
+  //     t = s.match(/\b(\d{1,2})\.(\d{2})\b/);
+  //     if (t) {
+  //       hh = t[1];
+  //       mm = t[2];
+  //     }
   //   }
 
-  //   console.log("📧 Successfully matched subject line format");
-
-  //   const date = subjectMatch[2]; // 23.08.2025
-  //   const time = subjectMatch[3]; // 15:00
-  //   const zip = subjectMatch[4]; // 58452
-  //   const city = subjectMatch[5].trim(); // Witten
-
-  //   // Format time properly (ensure HH:MM format)
-  //   let formattedTime = time;
-  //   const timeParts = formattedTime.split(":");
-  //   if (timeParts.length === 2) {
-  //     const hours = timeParts[0].padStart(2, "0");
-  //     const minutes = timeParts[1];
-  //     formattedTime = `${hours}:${minutes}`;
+  //   // else look for "H Uhr" or a lonely hour after ab/um
+  //   if (!hh) {
+  //     t = s.match(/(?:\b(?:ab|um)\s+)?\b(\d{1,2})\s*(?:Uhr\b)?/i);
+  //     if (t) {
+  //       hh = t[1];
+  //       mm = "00";
+  //     }
   //   }
 
-  //   // Clean city name (remove any trailing words, punctuation)
-  //   const cleanCity = city
-  //     .replace(/\s+(gesucht|neu|wartend|new)$/i, "")
-  //     .replace(/[.,!?]+$/, "")
-  //     .trim();
+  //   if (!hh) return null;
+  //   const timeStr = `${z2(hh)}:${mm || "00"}`;
 
-  //   const result = {
-  //     date: date,
-  //     time: formattedTime,
-  //     zip: zip,
-  //     city: cleanCity,
-  //   };
+  //   // --- ZIP + CITY ---
+  //   // zip = 5 digits, city = the words after zip until end / "gesucht"
+  //   const loc = s.match(
+  //     /\b(\d{5})\s+([A-Za-zÄÖÜäöüß\-.'()\/\s]+?)(?:\s+gesucht\b|$)/
+  //   );
+  //   if (!loc) return null;
+  //   const zip = loc[1];
+  //   const city = loc[2].trim().replace(/\s+/g, " ");
 
-  //   console.log(`✅ Parsed from subject line:`, result);
-  //   return result;
+  //   return { date: dateStr, time: timeStr, zip, city };
   // }
+
+  // SUBJECT → { date, time, zip, city }
+  parseJobDetailsFromSubject(subject, internalDate = new Date()) {
+    if (!subject) return null;
+
+    // Normalize
+    let s = subject.replace(/\s+/g, " ").trim();
+
+    // Ignore obvious non-job mails
+    if (/registrierung|registration|verify|best[äa]tig/i.test(s)) return null;
+
+    // remove "morgen," noise if present
+    s = s.replace(/\bmorgen,?\s*/i, "");
+
+    // --- DATE ---
+    let dateStr = null;
+    let m;
+
+    // With explicit year: DD.MM.YYYY
+    m = s.match(/\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b/);
+    if (m) {
+      dateStr = `${z2(m[1])}.${z2(m[2])}.${m[3]}`;
+    } else {
+      // Without year: DD.MM.  → choose a year
+      m = s.match(/\b(\d{1,2})\.(\d{1,2})\.?\b/);
+      if (!m) return null;
+
+      // Prefer current year for missing-year subjects (more practical for live jobs)
+      // You can flip this to internalDate.getFullYear() if you prefer.
+      const y = new Date().getFullYear();
+      dateStr = `${z2(m[1])}.${z2(m[2])}.${y}`;
+    }
+
+    // --- TIME (anchor to "um" or "ab" to avoid catching "29.04") ---
+    let hh = null,
+      mm = null;
+
+    // um 12:30 / ab 12:30
+    m = s.match(/\b(?:um|ab)\s+(\d{1,2}):(\d{2})\b/i);
+    if (m) {
+      hh = m[1];
+      mm = m[2];
+    }
+
+    // um 9.30 / ab 9.30 (but not part of a date; disallow trailing dot)
+    if (!hh && (m = s.match(/\b(?:um|ab)\s+(\d{1,2})\.(\d{2})(?!\.)\b/i))) {
+      hh = m[1];
+      mm = m[2];
+    }
+
+    // um 9 / ab 9 [Uhr]
+    if (!hh && (m = s.match(/\b(?:um|ab)\s+(\d{1,2})(?:\s*Uhr)?\b/i))) {
+      hh = m[1];
+      mm = "00";
+    }
+
+    // Final fallbacks: standalone HH:MM or HH.MM that are NOT immediately after a digit+dot (date)
+    if (!hh && (m = s.match(/(^|[^0-9.])(\d{1,2}):(\d{2})\b/))) {
+      hh = m[2];
+      mm = m[3];
+    }
+    if (!hh && (m = s.match(/(^|[^0-9.])(\d{1,2})\.(\d{2})\b(?!\.)/))) {
+      hh = m[2];
+      mm = m[3];
+    }
+
+    if (!hh) return null;
+    const timeStr = `${z2(hh)}:${mm || "00"}`;
+
+    // --- ZIP + CITY (Unicode letters, parentheses allowed) ---
+    const loc = s.match(/\b(\d{5})\s+([\p{L}\-.'()\/\s]+?)(?:\s+gesucht\b|$)/u);
+    if (!loc) return null;
+
+    const zip = loc[1];
+    const city = loc[2].replace(/\s+/g, " ").trim();
+
+    return { date: dateStr, time: timeStr, zip, city };
+  }
 
   // FIXED: Get ONLY the subject line for parsing
   async getSubjectPlusBody(uid) {

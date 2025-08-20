@@ -12,12 +12,14 @@
     "health": "curl -f http://localhost:3000/health || echo 'Health check failed'",
     "stats": "curl -s http://localhost:3000/stats | jq .",
     "test": "curl -X POST -H 'Content-Type: application/json' -d '{\"jobIds\":[\"TEST123\"]}' http://localhost:3000/trigger",
-    "setup": "./setup.sh"
+    "setup": "./setup.sh",
+    "test:apply": "node scripts/test-apply.js"
   },
   "dependencies": {
     "dotenv": "^17.2.1",
     "express": "^4.18.2",
     "googleapis": "^126.0.0",
+    "iconv-lite": "^0.6.3",
     "imap": "^0.8.19",
     "nodemailer": "^7.0.5",
     "playwright": "^1.54.2"
