@@ -1,5 +1,5 @@
 // src/lib/automator-simple.js
-// Fast, resilient Umzugshilfe automator (no fragile waitForNavigation on clicks)
+// Robust Umzugshilfe automator (single session, resilient selectors)
 
 const fs = require("fs");
 const path = require("path");
@@ -7,20 +7,23 @@ const { chromium } = require("playwright");
 
 const AUTH_STATE_PATH = path.resolve(process.cwd(), "auth.json");
 
+function escapeRe(s = "") {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 class UmzugshilfeAutomator {
   constructor() {
     this.browser = null;
     this.context = null;
     this.page = null;
-
-    this.isLoggedIn = false;
     this.ready = false;
+    this.isLoggedIn = false;
     this.keepAliveTimer = null;
 
     this.config = {
       username: process.env.LOGIN_USERNAME,
       password: process.env.LOGIN_PASSWORD,
-      baseUrl: "https://studenten-umzugshilfe.com",
+      baseUrl: "https://studenten-umzugshilfe.com", // matches your screenshots
       headless: process.env.NODE_ENV === "production",
       timeout: 25000,
       keepAliveMinutes: 4,
@@ -31,208 +34,178 @@ class UmzugshilfeAutomator {
 
   async initialize() {
     console.log("🤖 Initializing browser automation...");
-
     if (!this.config.username || !this.config.password) {
       throw new Error("LOGIN_USERNAME and LOGIN_PASSWORD must be configured");
     }
 
-    try {
-      this.browser = await chromium.launch({
-        headless: this.config.headless,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          // Do NOT use --single-process on Windows; it’s crashy
-        ],
-      });
+    this.browser = await chromium.launch({
+      headless: this.config.headless,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--no-first-run",
+        "--no-zygote",
+      ],
+    });
 
-      await this._createContextAndPage(true);
+    const ctxOptions = fs.existsSync(AUTH_STATE_PATH)
+      ? { storageState: AUTH_STATE_PATH }
+      : {};
+    this.context = await this.browser.newContext(ctxOptions);
+    this.page = await this.context.newPage({
+      viewport: { width: 1280, height: 800 },
+    });
+    this.page.setDefaultTimeout(this.config.timeout);
+    await this._blockNonEssentialRequests();
 
-      // First paint + auth check
-      await this._safeGoto(`${this.config.baseUrl}/`);
-      await this._ensureAuthenticated();
+    // land on home first (cheap) and check auth
+    await this.page.goto(`${this.config.baseUrl}/`, {
+      waitUntil: "domcontentloaded",
+    });
+    await this._dismissOverlays();
+    await this._ensureAuthenticated();
 
-      // Open Meine Jobs with a safe, retrying flow
-      const ok = await this._openMeineJobsWithRetry();
-      if (!ok) throw new Error("Failed to open Meine Jobs after login");
+    // Open Meine Jobs through Meine Daten (your nav shows the link there)
+    const ok = await this._openMeineJobsViaMeineDaten();
+    if (!ok) throw new Error("Failed to open Meine Jobs after login");
 
-      this.ready = true;
-      console.log("✅ Browser automation ready");
-    } catch (error) {
-      console.error("❌ Failed to initialize automation:", error);
-      await this.cleanup();
-      throw error;
-    }
+    this.ready = true;
+    this.isLoggedIn = true;
+    this._startKeepAlive();
+    console.log("✅ Browser automation ready");
   }
 
   /* --------------------------------- LOGIN --------------------------------- */
 
-  async login() {
-    console.log("🔐 Logging into Umzugshilfe...");
-    await this._guardAlive();
+  async _ensureAuthenticated() {
+    // If we see the login form, log in.
+    if (
+      await this.page
+        .locator("form#tl_login_235, input#username")
+        .first()
+        .isVisible()
+        .catch(() => false)
+    ) {
+      console.log("🔐 Session expired — re-logging in…");
+      await this._login();
+    }
+  }
 
-    // Go to login (DOM ready is enough; SPA/site may not hit networkidle)
-    await this._safeGoto(`${this.config.baseUrl}/login`);
+  async _login() {
+    console.log("🔐 Logging into Umzugshilfe...");
+    await this.page.goto(`${this.config.baseUrl}/login`, {
+      waitUntil: "domcontentloaded",
+    });
+    await this._dismissOverlays();
 
     await this.page.fill(
-      'input[name="username"], input#username',
+      'input#username, input[name="username"]',
       this.config.username
     );
     await this.page.fill(
-      'input[name="password"], input#password',
+      'input#password, input[name="password"]',
       this.config.password
     );
+    await this._dismissOverlays();
 
-    // Click submit; wait for either URL change (off /login) OR entries appearing
-    await this.page
-      .click(
-        'button[type="submit"], button:has-text("Anmelden"), button:has-text("Login")'
-      )
-      .catch(() => {});
-
-    // Give the app a moment to route; then verify we left /login
-    await Promise.race([
-      this.page
-        .waitForURL((url) => !/\/login\b/i.test(String(url)), {
-          timeout: this.config.timeout,
-        })
-        .catch(() => {}),
-      this.page
-        .waitForSelector("div.entry", { timeout: this.config.timeout })
-        .catch(() => {}),
+    await Promise.all([
+      // don't use networkidle (site may keep long connections); wait for nav or a post-login element
+      this.page.waitForLoadState("domcontentloaded"),
+      this.page.click('button[type="submit"], button:has-text("Anmelden")'),
     ]);
 
-    const stillOnLogin =
-      this.page.url().includes("/login") ||
-      !!(await this.page.$('input[name="username"], #username'));
+    // Wait until the post-login nav ("Meine Jobs") is present anywhere
+    const navOk = await this.page
+      .locator('a[href*="intern/meine-jobs"], a:has-text("Meine Jobs")')
+      .first()
+      .waitFor({ state: "visible", timeout: 8000 })
+      .then(() => true)
+      .catch(() => false);
 
-    if (stillOnLogin) throw new Error("Login failed - check credentials");
+    if (!navOk) {
+      throw new Error("Login failed - check credentials");
+    }
 
-    // Save cookies for quick restarts
+    // Save cookies for faster cold starts
     await this.context.storageState({ path: AUTH_STATE_PATH });
-
-    // Confirm Meine Jobs opens
-    const ok = await this._openMeineJobsWithRetry();
-    if (!ok) throw new Error("Login ok, but Meine Jobs did not load");
-
-    this.isLoggedIn = true;
-    this._startKeepAlive();
-    console.log("✅ Successfully logged in");
   }
 
-  async _ensureAuthenticated() {
-    await this._guardAlive();
-    const atLogin =
-      this.page.url().includes("/login") ||
-      !!(await this.page.$('input[name="username"], #username'));
-    if (atLogin) {
-      console.log("🔐 Session expired — re-logging in…");
-      await this.login();
-    }
-  }
+  /* -------------------------- NAVIGATING TO THE LIST ----------------------- */
 
-  /* -------------------------- MEINE JOBS NAVIGATION ------------------------- */
-
-  async _openMeineJobsWithRetry() {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const ok = await this.ensureMeineJobsOpen();
-        if (ok) return true;
-        throw new Error("Meine Jobs not loaded");
-      } catch (e) {
-        console.warn(
-          `⚠️ ensureMeineJobsOpen attempt ${attempt} failed: ${e.message}`
-        );
-        await this._recreatePage(
-          attempt === 1 /* resetContext on second run */
-        );
-        await this._safeGoto(`${this.config.baseUrl}/`);
-        await this._ensureAuthenticated();
-      }
-    }
-    return false;
-  }
-
-  // Open Meine Jobs like a human: click the nav link if present; otherwise direct URL.
-  async ensureMeineJobsOpen() {
-    await this._guardAlive();
-
-    // If already there and entries exist, done
+  // The “Meine Jobs” link is reliably visible on /intern/meine-daten (your screenshot).
+  async _openMeineJobsViaMeineDaten() {
+    // If we're already on the list and entries exist, done.
     if (this.page.url().includes("/intern/meine-jobs")) {
       const count = await this.page.locator("div.entry").count();
       if (count > 0) return true;
     }
 
-    await this._safeGoto(`${this.config.baseUrl}/`);
+    // Go to Meine Daten where the nav shows the link
+    await this.page.goto(`${this.config.baseUrl}/intern/meine-daten`, {
+      waitUntil: "domcontentloaded",
+    });
+    await this._dismissOverlays();
+    await this._ensureAuthenticated();
 
-    const jobsLink = this.page.getByRole("link", { name: /meine jobs/i });
-    if ((await jobsLink.count()) > 0) {
-      // Click; do NOT waitForNavigation (SPA or partial updates possible)
-      await jobsLink
+    const jobsLink = this.page.locator('a[href*="intern/meine-jobs"]');
+    const gotLink = await jobsLink
+      .first()
+      .waitFor({ state: "visible", timeout: 8000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!gotLink) return false;
+
+    await this._dismissOverlays();
+
+    await Promise.all([
+      this.page.waitForLoadState("domcontentloaded"),
+      jobsLink.first().click(),
+    ]);
+
+    // Wait for at least one entry; if missing, try one reload
+    let ok = await this.page
+      .locator("div.entry")
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (!ok) {
+      console.log("⚠️ Meine Jobs elements not found yet, reloading once…");
+      await this.page.reload({ waitUntil: "domcontentloaded" });
+      ok = await this.page
+        .locator("div.entry")
         .first()
-        .click()
-        .catch(() => {});
-      await Promise.race([
-        this.page
-          .waitForURL(/\/intern\/meine-jobs/i, { timeout: 8000 })
-          .catch(() => {}),
-        this.page
-          .waitForSelector("div.entry", { timeout: 8000 })
-          .catch(() => {}),
-      ]);
-    } else {
-      await this._safeGoto(`${this.config.baseUrl}/intern/meine-jobs`);
+        .isVisible()
+        .catch(() => false);
     }
+    return ok;
+  }
 
-    await this._ensureAuthenticated();
-
-    // Wait for entries to exist (hydrate)
-    await this.page
-      .waitForSelector("div.entry", { timeout: 8000 })
-      .catch(() => {});
-    let cnt = await this.page.locator("div.entry").count();
-    if (cnt > 0) return true;
-
-    // Last resort: reload once
+  // Refresh list (used before each apply)
+  async _refreshMeineJobs() {
+    if (!this.page.url().includes("/intern/meine-jobs")) {
+      const ok = await this._openMeineJobsViaMeineDaten();
+      return ok;
+    }
     await this.page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-    await this.page
-      .waitForSelector("div.entry", { timeout: 8000 })
-      .catch(() => {});
-    cnt = await this.page.locator("div.entry").count();
-    return cnt > 0;
-  }
-
-  // Use before acting so we always see the freshest state
-  async goToMeineJobs() {
+    await this._dismissOverlays();
     await this._ensureAuthenticated();
-
-    if (this.page.url().includes("/intern/meine-jobs")) {
-      await this.page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-      await this._ensureAuthenticated();
-    } else {
-      const ok = await this.ensureMeineJobsOpen();
-      if (!ok) return false;
-    }
-
     await this.page
-      .waitForSelector("div.entry", { timeout: 8000 })
+      .locator("div.entry")
+      .first()
+      .waitFor({ timeout: 8000 })
       .catch(() => {});
-    const total = await this.page.locator("div.entry").count();
-    const fresh = await this.page
-      .locator('div.entry[data-status="new"], div.entry[data-status="neu"]')
-      .count();
-    console.log(
-      `📄 Page loaded with ${total} total entries, ${fresh} new entries`
-    );
-    return total > 0;
+    return (await this.page.locator("div.entry").count()) > 0;
   }
 
-  /* ------------------------------ APPLY LOGIC ------------------------------- */
+  /* ------------------------------ APPLY BY ID ------------------------------- */
 
   async applyToJob(jobId) {
-    const ok = await this.goToMeineJobs();
-    if (!ok) return false;
+    const ok = await this._refreshMeineJobs();
+    if (!ok) {
+      console.log("⚠️ Could not load Meine Jobs");
+      return false;
+    }
 
     const entry = this.page
       .locator("div.entry")
@@ -241,119 +214,161 @@ class UmzugshilfeAutomator {
       console.log(`⚠️ Job #${jobId} not present on Meine Jobs`);
       return false;
     }
-    return await this._submitAcceptInEntry(entry.first());
+    return await this._clickAccept(entry.first());
   }
 
-  // date "DD.MM.YYYY", time "HH:MM", zip "12345", city optional
+  /* ------------------------ APPLY BY DATE/TIME/ZIP/CITY --------------------- */
+
+  // date: "27.08.2025", time: "13:00" (or "9:00" – we’ll zero-pad), zip: "50670", city: "Köln"(optional)
   async applyToJobByDetails({ date, time, zip, city }) {
-    const ok = await this.goToMeineJobs();
-    if (!ok)
-      console.log("⚠️ Page elements not found after reload, continuing…");
+    // Normalize time (e.g., "9:00" -> "09:00")
+    if (time) {
+      const m = String(time).match(/^(\d{1,2}):(\d{2})$/);
+      if (m) time = `${String(m[1]).padStart(2, "0")}:${m[2]}`;
+    }
 
-    const norm = (s) =>
-      s
-        .replace(/\u00A0/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-    const needle = norm(`Am ${date} um ${time} in ${zip}`);
+    const ok = await this._refreshMeineJobs();
+    if (!ok) {
+      console.log("⚠️ Could not load Meine Jobs");
+      return false;
+    }
 
-    // Prefer entries in NEW/NEU state and match inside the date/location span
+    // Build the exact phrase you showed: “Am DD.MM.YYYY um HH:MM in 12345 City”
+    // Use a regex to be robust to NBSP and tiny whitespace diffs.
+    const re = new RegExp(
+      `Am\\s+${escapeRe(date)}\\s+um\\s+${escapeRe(time)}\\s+in\\s+${escapeRe(
+        zip
+      )}(?:\\s+${escapeRe(city || "")})?`,
+      "i"
+    );
+
+    // Prefer new/neu entries
     let entry = this.page
       .locator('div.entry[data-status="new"], div.entry[data-status="neu"]')
       .filter({
-        has: this.page.locator("span.date.location"),
-        hasText: needle,
+        has: this.page.locator("span.date.location", { hasText: re }),
       });
 
     if ((await entry.count()) === 0) {
-      // Fallback: match anywhere inside the entry
-      entry = this.page
-        .locator('div.entry[data-status="new"], div.entry[data-status="neu"]')
-        .filter({ hasText: needle });
+      // Fallback: any entry, search by text content
+      entry = this.page.locator("div.entry").filter({
+        has: this.page.locator("span.date.location", { hasText: re }),
+      });
 
       if ((await entry.count()) === 0) {
-        console.log(`❌ No row found for: ${needle}${city ? " " + city : ""}`);
+        console.log(
+          `❌ No row found for: Am ${date} um ${time} in ${zip}${
+            city ? " " + city : ""
+          }`
+        );
         return false;
       }
     }
 
-    return await this._submitAcceptInEntry(entry.first());
+    return await this._clickAccept(entry.first());
   }
 
-  async _submitAcceptInEntry(entry) {
-    const form = entry.locator("form");
-    const submit = form.locator(
-      '#ctrl_accept, button[name="accept"], input[type="submit"][name="accept"]'
+  /* ------------------------------- CLICK ACCEPT ----------------------------- */
+
+  async _clickAccept(entry) {
+    // The button you highlighted: <button type="submit" id="ctrl_accept" ...>
+    const submit = entry.locator(
+      'form button#ctrl_accept, form button[name="accept"], form input[type="submit"][name="accept"]'
     );
 
     if ((await submit.count()) === 0) {
-      console.log("⚠️ Accept submit not found in entry");
+      console.log("⚠️ Accept button not found in entry");
       return false;
     }
 
-    // Click immediately; then wait for either URL change OR list mutation
-    await submit
-      .first()
-      .click()
-      .catch(() => {});
-    await Promise.race([
-      this.page
-        .waitForURL((url) => /\/intern\/meine-jobs/i.test(String(url)), {
-          timeout: 8000,
-        })
-        .catch(() => {}),
-      this.page.waitForTimeout(500), // small settle
+    // Click and wait briefly for either navigation or in-place mutation
+    await Promise.allSettled([
+      this.page.waitForLoadState("domcontentloaded", { timeout: 8000 }),
+      submit.first().click(),
     ]);
 
-    // If the entry disappeared, success
+    // Small settle; list usually changes in place
+    await this.page.waitForTimeout(300);
+
+    // If the entry disappeared, treat as success
     if ((await entry.count()) === 0) return true;
 
-    // Check for status flip or "red X"
-    const statusAfter = (await entry.first().getAttribute("data-status")) || "";
-    if (/(waiting|wartend|accepted|pending)/i.test(statusAfter)) return true;
+    // Or if status changed to waiting/accepted…
+    const status = (await entry.first().getAttribute("data-status")) || "";
+    if (/(waiting|wartend|accepted|pending)/i.test(status)) return true;
 
+    // Some UIs draw a cancel/red-X once accepted
     const hasX = await entry
       .locator("button:has-text('x'), .btn.red, .accepted-state")
       .count();
-    if (hasX > 0) return true;
-
-    // Final verification: reload and re-check
-    await this.page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-    await this.page
-      .waitForSelector("div.entry", { timeout: 6000 })
-      .catch(() => {});
-    const stillThere = await entry.count();
-    if (!stillThere) return true;
-    const statusReload =
-      (await entry.first().getAttribute("data-status")) || "";
-    return /(waiting|wartend|accepted|pending)/i.test(statusReload);
+    return hasX > 0;
   }
 
-  /* ------------------------------ UTILITIES -------------------------------- */
-
-  async _safeGoto(url) {
-    await this._guardAlive();
+  // Kill cookie banners / consent modals / sticky overlays
+  async _dismissOverlays() {
     try {
-      // 'domcontentloaded' avoids long hangs on 'networkidle' for SPAs
-      await this.page.goto(url, {
-        waitUntil: "domcontentloaded",
-        timeout: this.config.timeout,
-      });
-    } catch (_) {
-      // Try once more with a lighter wait
-      try {
-        await this.page.goto(url, {
-          waitUntil: "load",
-          timeout: this.config.timeout,
-        });
-      } catch {}
-    }
+      // Common consent buttons (German): Akzeptieren / Verstanden / Zustimmen / OK
+      const candidates = [
+        'cms-accept-tags button:has-text("Akzeptieren")',
+        'cms-accept-tags button:has-text("Verstanden")',
+        'cms-accept-tags button:has-text("Zustimmen")',
+        'cms-accept-tags button:has-text("OK")',
+        '.cookiebar button:has-text("OK")',
+        '#cookiebar button:has-text("OK")',
+        'button:has-text("Alle akzeptieren")',
+        'button[aria-label="Akzeptieren"]',
+      ];
+
+      for (const sel of candidates) {
+        const btn = this.page.locator(sel);
+        if (await btn.count()) {
+          await btn
+            .first()
+            .click({ timeout: 1000 })
+            .catch(() => {});
+          await this.page.waitForTimeout(150);
+        }
+      }
+
+      // Close buttons
+      const closers = [
+        'cms-accept-tags [aria-label="Schließen"]',
+        "cms-accept-tags .close",
+        ".cookiebar .close",
+      ];
+      for (const sel of closers) {
+        const x = this.page.locator(sel);
+        if (await x.count()) {
+          await x
+            .first()
+            .click({ timeout: 1000 })
+            .catch(() => {});
+          await this.page.waitForTimeout(150);
+        }
+      }
+
+      // Fallback: remove overlay if it still blocks pointer events
+      await this.page
+        .evaluate(() => {
+          const kill = (q) => document.querySelector(q)?.remove();
+          kill("cms-accept-tags");
+          const mod = document.querySelector(".mod_cms_accept_tags");
+          if (mod) mod.remove();
+          const cb = document.querySelector(
+            "#cookiebar, .cookiebar, #cookie-bar, .cookie-bar"
+          );
+          if (cb) cb.remove();
+          document.body.classList.remove("cookie-bar-visible");
+        })
+        .catch(() => {});
+    } catch (_) {}
   }
 
-  async blockNonEssentialRequests() {
+  /* -------------------------------- UTILITIES ------------------------------- */
+
+  async _blockNonEssentialRequests() {
     await this.page.route("**/*", (route) => {
       const type = route.request().resourceType();
-      // Keep stylesheets; blocking can break clickable areas
       if (["image", "font", "media"].includes(type)) return route.abort();
       route.continue();
     });
@@ -361,11 +376,10 @@ class UmzugshilfeAutomator {
 
   _startKeepAlive() {
     if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
-    const interval = Math.max(2, this.config.keepAliveMinutes) * 60 * 1000;
-
+    const every = Math.max(2, this.config.keepAliveMinutes) * 60 * 1000;
     this.keepAliveTimer = setInterval(async () => {
       try {
-        if (!this._pageAlive()) return;
+        if (!this.page) return;
         await this.page.evaluate(async () => {
           try {
             await fetch("/intern/meine-daten", {
@@ -374,101 +388,20 @@ class UmzugshilfeAutomator {
             });
           } catch (_) {}
         });
-      } catch {}
-    }, interval);
+      } catch (_) {}
+    }, every);
   }
-
-  _setupCrashDiagnostics() {
-    try {
-      this.browser.on("disconnected", () =>
-        console.error("❌ Browser disconnected")
-      );
-      this.context?.on?.("close", () => console.error("❌ Context closed"));
-      this.page?.on?.("close", () => console.error("❌ Page closed"));
-    } catch {}
-  }
-
-  _pageAlive() {
-    return this.page && !this.page.isClosed();
-  }
-
-  async _guardAlive() {
-    if (!this._pageAlive()) await this._recreatePage(false);
-  }
-
-  async _createContextAndPage(preferAuthState = false) {
-    const ctxOptions =
-      preferAuthState && fs.existsSync(AUTH_STATE_PATH)
-        ? { storageState: AUTH_STATE_PATH }
-        : {};
-    this.context = await this.browser.newContext(ctxOptions);
-    this.page = await this.context.newPage({
-      viewport: { width: 1280, height: 720 },
-    });
-    await this.blockNonEssentialRequests();
-    this.page.setDefaultTimeout(this.config.timeout);
-    this._setupCrashDiagnostics();
-  }
-
-  async _recreatePage(resetContext = false) {
-    try {
-      if (this.page && !this.page.isClosed()) await this.page.close();
-    } catch {}
-    if (resetContext && this.context) {
-      try {
-        await this.context.close();
-      } catch {}
-      this.context = null;
-    }
-    if (!this.context) {
-      const ctxOptions = fs.existsSync(AUTH_STATE_PATH)
-        ? { storageState: AUTH_STATE_PATH }
-        : {};
-      this.context = await this.browser.newContext(ctxOptions);
-    }
-    this.page = await this.context.newPage({
-      viewport: { width: 1280, height: 720 },
-    });
-    await this.blockNonEssentialRequests();
-    this.page.setDefaultTimeout(this.config.timeout);
-    this._setupCrashDiagnostics();
-  }
-
-  async _maybeScreenshot(tag) {
-    if (process.env.DEBUG_MODE === "true") {
-      try {
-        await this.page.screenshot({
-          path: `debug-${tag}-${Date.now()}.png`,
-          fullPage: true,
-        });
-      } catch {}
-    }
-  }
-
-  /* ------------------------------- LIFECYCLE -------------------------------- */
 
   async cleanup() {
-    console.log("🧹 Cleaning up browser automation...");
     try {
       if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
-      if (this.page) {
-        await this.page.close();
-        this.page = null;
-      }
-      if (this.context) {
-        await this.context.close();
-        this.context = null;
-      }
-      if (this.browser) {
-        await this.browser.close();
-        this.browser = null;
-      }
-      this.ready = false;
-      this.isLoggedIn = false;
-      console.log("✅ Browser cleanup completed");
-    } catch (error) {
-      console.error("❌ Error during cleanup:", error);
-    }
+      if (this.page) await this.page.close();
+      if (this.context) await this.context.close();
+      if (this.browser) await this.browser.close();
+    } catch {}
+    this.ready = false;
+    this.isLoggedIn = false;
+    console.log("✅ Browser cleanup completed");
   }
 
   isReady() {
@@ -476,7 +409,7 @@ class UmzugshilfeAutomator {
   }
 
   async healthCheck() {
-    if (!this.ready || !this._pageAlive()) return false;
+    if (!this.ready || !this.page) return false;
     try {
       return await this.page.evaluate(() => document.readyState === "complete");
     } catch {
