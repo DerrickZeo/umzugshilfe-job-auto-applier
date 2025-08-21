@@ -303,8 +303,8 @@ class UmzugshilfeAutomator {
         }
 
         // If still not found, debug the page content
-        console.log("❌ No entry found with any pattern, debugging page...");
-        await this._debugPageContent();
+        // console.log("❌ No entry found with any pattern, debugging page...");
+        // await this._debugPageContent();
 
         return false;
       }
