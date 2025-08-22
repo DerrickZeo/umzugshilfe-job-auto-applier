@@ -186,4 +186,4 @@ error-screenshots/
 # Error logs and debugging
 error-*.log
 debug-*.log
-trace-*.log
+trace-*.logauth.json
