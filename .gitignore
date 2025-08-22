@@ -187,3 +187,4 @@ error-screenshots/
 error-*.log
 debug-*.log
 trace-*.logauth.json
+auth.json

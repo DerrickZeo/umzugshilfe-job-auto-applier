@@ -3,7 +3,7 @@
 require("dotenv").config();
 
 const express = require("express");
-const { UmzugshilfeAutomator } = require("./src/lib/automator-simple-new");
+const { UmzugshilfeAutomator } = require("./src/lib/automator-simple-fetch");
 const { EmailWatcher } = require("./src/lib/email-watcher-smtp-new");
 // ── Normalization helpers for details coming from email subjects ──
 const z2 = (n) => String(n).padStart(2, "0");
